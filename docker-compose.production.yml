@@ -1,0 +1,102 @@
+version: '3.8'
+
+# ═══════════════════════════════════════════════════════════
+# Trading Bot - Production Docker Compose
+# ⚠️ Торговля несёт риск потери капитала
+# ═══════════════════════════════════════════════════════════
+
+services:
+  # ─────────────────────────────────────────────────────────
+  # PostgreSQL - База данных
+  # ─────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: trading_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trading_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-trader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # Оптимизации для SSD
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      # ⚠️ ВАЖНО: Named volume сохраняет данные между деплоями
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"  # Только localhost
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-trading_bot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Graceful shutdown
+    stop_grace_period: 30s
+
+  # ─────────────────────────────────────────────────────────
+  # Trading Bot - Основной сервис
+  # ─────────────────────────────────────────────────────────
+  bot:
+    image: ${DOCKER_IMAGE:-trading_bot}:${DOCKER_TAG:-latest}
+    container_name: trading_bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Tinkoff API
+      TINKOFF_TOKEN: ${TINKOFF_TOKEN:?TINKOFF_TOKEN is required}
+      TINKOFF_ACCOUNT_ID: ${TINKOFF_ACCOUNT_ID:-}
+      
+      # Telegram
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is required}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID is required}
+      
+      # Database
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-trading_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-trader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      
+      # Trading
+      DEPOSIT_RUB: ${DEPOSIT_RUB:-1000000}
+      RISK_PER_TRADE_PCT: ${RISK_PER_TRADE_PCT:-0.01}
+      MAX_POSITION_PCT: ${MAX_POSITION_PCT:-0.25}
+    volumes:
+      # Конфиг (read-only)
+      - ./config.yaml:/app/config.yaml:ro
+      # Логи
+      - bot_logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # Graceful shutdown - ждём завершения текущих операций
+    stop_grace_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+# ─────────────────────────────────────────────────────────
+# Volumes - Сохраняются между деплоями!
+# ─────────────────────────────────────────────────────────
+volumes:
+  # ⚠️ НЕ УДАЛЯТЬ - содержит все данные БД
+  postgres_data:
+    name: trading_postgres_data
+  
+  # Логи бота
+  bot_logs:
+    name: trading_bot_logs
+
+# ─────────────────────────────────────────────────────────
+# Networks
+# ─────────────────────────────────────────────────────────
+networks:
+  default:
+    name: trading_network

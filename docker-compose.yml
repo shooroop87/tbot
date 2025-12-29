@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  # ═══════════════════════════════════════════════════════════
+  # PostgreSQL
+  # ═══════════════════════════════════════════════════════════
+  postgres:
+    image: postgres:15-alpine
+    container_name: trading_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trading_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-trader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-trading_bot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ═══════════════════════════════════════════════════════════
+  # Trading Bot
+  # ═══════════════════════════════════════════════════════════
+  bot:
+    build: .
+    container_name: trading_bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Tinkoff API
+      TINKOFF_TOKEN: ${TINKOFF_TOKEN}
+      TINKOFF_ACCOUNT_ID: ${TINKOFF_ACCOUNT_ID:-}
+      
+      # Telegram
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      
+      # Database
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-trading_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-trader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      
+      # Trading
+      DEPOSIT_RUB: ${DEPOSIT_RUB:-1000000}
+      RISK_PER_TRADE_PCT: ${RISK_PER_TRADE_PCT:-0.01}
+      MAX_POSITION_PCT: ${MAX_POSITION_PCT:-0.25}
+    volumes:
+      - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ═══════════════════════════════════════════════════════════
+  # Adminer (опционально, для просмотра БД)
+  # ═══════════════════════════════════════════════════════════
+  adminer:
+    image: adminer:latest
+    container_name: trading_adminer
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+    profiles:
+      - tools  # Запуск: docker-compose --profile tools up -d
+
+volumes:
+  postgres_data:

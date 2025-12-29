@@ -1,0 +1,28 @@
+{
+  "name": "blisterbox",
+  "version": "1.0.0",
+  "description": "## 🚀 Запуск проекта локально через Docker",
+  "main": "postcss.config.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shooroop87/blisterbox.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/shooroop87/blisterbox/issues"
+  },
+  "homepage": "https://github.com/shooroop87/blisterbox#readme",
+  "devDependencies": {
+    "@fullhuman/postcss-purgecss": "^7.0.2",
+    "autoprefixer": "^10.4.21",
+    "cssnano": "^7.1.1",
+    "postcss": "^8.5.6",
+    "postcss-cli": "^11.0.1"
+  }
+}

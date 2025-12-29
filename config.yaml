@@ -1,0 +1,63 @@
+# ═══════════════════════════════════════════════════════════
+# Trading Bot Configuration
+# ⚠️ Торговля несёт риск потери капитала
+# ═══════════════════════════════════════════════════════════
+
+# Параметры стратегий
+strategy:
+  bollinger_bounce:
+    enabled: true
+    bollinger_period: 20
+    bollinger_std: 2.0
+    entry_threshold_pct: 1.0    # Вход если цена < BB_lower + 1%
+    
+  ema_crossover:
+    enabled: false
+    fast_period: 9
+    slow_period: 21
+    adx_threshold: 25           # ADX > 25 для подтверждения тренда
+
+# ATR
+atr:
+  period: 14
+
+# Торговые часы (МСК) - только эти часы используются для расчёта индикаторов
+trading_hours:
+  start: "10:00"
+  end: "19:00"
+  timezone: "Europe/Moscow"
+
+# Критерии ликвидности
+liquidity:
+  min_avg_volume_rub: 50000000    # Мин. оборот 50М руб/день
+  min_trades_per_day: 1000         # Мин. сделок в день
+  max_spread_pct: 0.15             # Макс. спред 0.15%
+  lookback_days: 20                # Период анализа
+  max_instruments: 30              # Макс. инструментов для анализа
+
+# Риск-менеджмент
+risk:
+  stop_loss_atr: 0.3              # Стоп = 0.3 × ATR
+  take_profit_atr: 0.5            # Тейк = 0.5 × ATR
+  max_position_pct: 0.25          # Макс 25% депозита на позицию
+  max_margin_pct: 0.30            # Макс 30% на ГО (для фьючерсов)
+  max_open_positions: 3           # Макс одновременных позиций
+  max_daily_loss_pct: 0.03        # Стоп торговли при -3% за день
+  cooldown_after_stop_min: 30     # Пауза после стопа
+
+# Безопасность
+safety:
+  dry_run: true                   # true = без реальных сделок
+  kill_switch: false              # Аварийная остановка
+
+# Расписание
+schedule:
+  daily_calc_time: "06:30"        # Время ежедневного расчёта (МСК)
+  
+# Инструменты (опционально - если пусто, выбираем автоматически по ликвидности)
+instruments:
+  futures:
+    - base_asset: "USD"           # Фьючерс Si (доллар)
+  # shares:
+  #   - figi: "BBG004730N88"      # Sber
+  #   - figi: "BBG006L8G4H1"      # Yandex
