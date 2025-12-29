@@ -1,5 +1,34 @@
 # Tinkoff Invest API
-TINKOFF_TOKEN=твой_токен
-TELEGRAM_BOT_TOKEN=5855003660:AAEr4gXXwv_S45aTjK68-imsZ8sfBl7jR9Y
-TELEGRAM_CHAT_ID=771081107
-POSTGRES_PASSWORD=SecurePass123
+tinkoff-investments==0.2.0-beta93
+
+# Database
+sqlalchemy==2.0.23
+asyncpg==0.29.0
+alembic==1.13.1
+
+# Async
+aiohttp==3.9.1
+
+# Telegram
+aiogram==3.3.0
+
+# Data processing
+pandas==2.1.4
+numpy==1.26.2
+
+# Config
+pyyaml==6.0.1
+python-dotenv==1.0.0
+
+# Scheduling
+apscheduler==3.10.4
+
+# Logging
+structlog==23.2.0
+
+# Timezone
+pytz==2023.3
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.23.2
