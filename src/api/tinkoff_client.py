@@ -10,14 +10,15 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 import structlog
-from tinkoff.invest import (
+from t_tech.invest import (
     AsyncClient,
     CandleInterval,
     InstrumentStatus,
     SharesResponse,
     GetCandlesResponse,
 )
-from tinkoff.invest.utils import quotation_to_decimal
+from t_tech.invest.constants import INVEST_GRPC_API
+from t_tech.invest.utils import quotation_to_decimal
 
 from config import TinkoffConfig
 
@@ -39,8 +40,11 @@ class TinkoffClient:
 
     async def __aenter__(self) -> "TinkoffClient":
         """Вход в async context."""
-        self._client = await AsyncClient(token=self.token).__aenter__()
-        logger.info("tinkoff_client_connected")
+        self._client = await AsyncClient(
+            token=self.token,
+            target=INVEST_GRPC_API  # Боевой контур: invest-public-api.tbank.ru:443
+        ).__aenter__()
+        logger.info("tinkoff_client_connected", target="prod")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):

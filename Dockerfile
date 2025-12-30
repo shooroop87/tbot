@@ -12,7 +12,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем код
-COPY config.yaml .
 COPY src/ ./src/
 
 # Рабочая директория

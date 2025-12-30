@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional
 
 import pytz
 import structlog
-from tinkoff.invest import CandleInterval
+from t_tech.invest import CandleInterval
 
 from config import Config
 from api.tinkoff_client import TinkoffClient

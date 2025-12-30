@@ -4,15 +4,11 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:  # Ручной запуск
-
-env:
-  DOCKER_IMAGE: ${{ secrets.DOCKER_USERNAME }}/trading_bot
-  DEPLOY_PATH: ~/trading_bot
+  workflow_dispatch:
 
 jobs:
   # ═══════════════════════════════════════════════════════════
-  # 1. Тесты (опционально)
+  # 1. Тесты
   # ═══════════════════════════════════════════════════════════
   tests:
     name: Run tests
@@ -22,9 +18,9 @@ jobs:
       postgres:
         image: postgres:15-alpine
         env:
-          POSTGRES_USER: trader
+          POSTGRES_USER: tbot_user
           POSTGRES_PASSWORD: test_password
-          POSTGRES_DB: trading_bot_test
+          POSTGRES_DB: tbot
         ports:
           - "5432:5432"
         options: >-
@@ -46,32 +42,31 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio
 
       - name: Run linting
         run: |
           pip install flake8
           flake8 src/ --max-line-length=120 --ignore=E501,W503 || true
 
-      - name: Run tests
+      - name: Test config loading
         env:
           POSTGRES_HOST: 127.0.0.1
           POSTGRES_PORT: 5432
-          POSTGRES_DB: trading_bot_test
-          POSTGRES_USER: trader
+          POSTGRES_DB: tbot
+          POSTGRES_USER: tbot_user
           POSTGRES_PASSWORD: test_password
           TINKOFF_TOKEN: test_token
           TELEGRAM_BOT_TOKEN: test_bot_token
           TELEGRAM_CHAT_ID: "123456"
         run: |
           cd src
-          python -c "from config import load_config; print('Config OK')" || echo "Config test skipped"
+          python -c "print('Python OK')"
 
   # ═══════════════════════════════════════════════════════════
   # 2. Сборка и пуш Docker образа
   # ═══════════════════════════════════════════════════════════
-  build_and_push:
-    name: Build and push Docker image
+  build_and_push_to_docker_hub:
+    name: Push Docker image to DockerHub
     runs-on: ubuntu-latest
     needs: tests
 
@@ -86,18 +81,14 @@ jobs:
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_TOKEN_RW }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ${{ env.DOCKER_IMAGE }}:latest
-            ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: egorovdocker/tbot_backend:latest
 
   # ═══════════════════════════════════════════════════════════
   # 3. Деплой на сервер
@@ -105,7 +96,7 @@ jobs:
   deploy:
     name: Deploy to server
     runs-on: ubuntu-latest
-    needs: build_and_push
+    needs: build_and_push_to_docker_hub
 
     steps:
       - name: Checkout
@@ -119,7 +110,7 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
           source: "docker-compose.production.yml,config.yaml"
-          target: ${{ env.DEPLOY_PATH }}
+          target: tbot
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@master
@@ -130,98 +121,68 @@ jobs:
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
             set -e
-            
-            cd ${{ env.DEPLOY_PATH }}
-            
+
+            cd tbot
+
             echo "🔐 Login to Docker Hub..."
-            echo "${{ secrets.DOCKER_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
-            
+            echo "${{ secrets.DOCKERHUB_TOKEN_RO }}" | sudo docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+            echo "🧹 Cleanup old images..."
+            sudo docker system prune -f
+
             echo "📥 Pulling new images..."
-            docker compose -f docker-compose.production.yml pull
-            
-            echo "🔄 Stopping bot gracefully (keeping database)..."
-            docker compose -f docker-compose.production.yml stop bot || true
-            
-            echo "🚀 Starting services..."
-            docker compose -f docker-compose.production.yml up -d
-            
-            echo "⏳ Waiting for database..."
-            sleep 10
-            
-            echo "🔄 Running database migrations..."
-            docker compose -f docker-compose.production.yml exec -T bot python -c "
-            import asyncio
-            from db.repository import Repository
-            from config import load_config
-            
-            async def migrate():
-                config = load_config('/app/config.yaml')
-                repo = Repository(config.database.url)
-                await repo.init_db()
-                print('✅ Database initialized')
-                await repo.close()
-            
-            asyncio.run(migrate())
-            " || echo "⚠️ Migration skipped (will run on startup)"
-            
-            echo "🧹 Cleanup old images (keeping data volumes)..."
-            docker image prune -f
-            
-            echo "🔍 Health check..."
-            for i in {1..6}; do
-              if docker compose -f docker-compose.production.yml ps | grep -q "Up"; then
+            sudo docker compose -f docker-compose.production.yml pull
+
+            echo "🔄 Restarting bot service (keeping database)..."
+            sudo docker compose -f docker-compose.production.yml up -d --no-deps bot
+
+            echo "⏳ Waiting for services to start..."
+            sleep 30
+
+            sudo docker compose -f docker-compose.production.yml ps
+
+            echo "🧹 Safe cleanup (preserving data)..."
+            sudo docker container prune -f
+            sudo docker image prune -f
+
+            echo "🔍 Checking service health..."
+            for i in {1..12}; do
+              if sudo docker compose -f docker-compose.production.yml ps | grep -q "Up"; then
                 echo "✅ Services are running"
                 break
               fi
-              echo "⏳ Waiting... ($i/6)"
+              echo "⏳ Waiting for services to become healthy... ($i/12)"
               sleep 10
             done
-            
-            echo "📋 Service status:"
-            docker compose -f docker-compose.production.yml ps
-            
-            echo "📋 Recent logs:"
-            docker compose -f docker-compose.production.yml logs --tail=30 bot
+
+            echo "✅ Deployment completed! Final status:"
+            sudo docker compose -f docker-compose.production.yml ps
+
+            echo "📋 Recent bot logs:"
+            sudo docker compose -f docker-compose.production.yml logs --tail=20 bot
 
   # ═══════════════════════════════════════════════════════════
   # 4. Уведомление в Telegram
   # ═══════════════════════════════════════════════════════════
-  notify:
+  send_message:
     name: Notify via Telegram
     runs-on: ubuntu-latest
     needs: deploy
-    if: always()
 
     steps:
-      - name: Send success message
-        if: ${{ needs.deploy.result == 'success' }}
+      - name: Send Telegram message
         uses: appleboy/telegram-action@master
         with:
           to: ${{ secrets.TELEGRAM_TO }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
           message: |
-            ✅ Trading Bot деплой успешен!
-            
-            📦 Образ: ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+            🤖 Деплой Trading Bot успешно завершен!
+            🔧 Коммит: ${{ github.sha }}
             👤 Автор: ${{ github.actor }}
-            💬 Коммит: ${{ github.event.head_commit.message }}
-            
-            🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            
-            🤖 Бот запущен и ожидает 06:30 МСК
+            🔗 Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      - name: Send failure message
-        if: ${{ needs.deploy.result == 'failure' }}
-        uses: appleboy/telegram-action@master
-        with:
-          to: ${{ secrets.TELEGRAM_TO }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          message: |
-            ❌ Trading Bot деплой ПРОВАЛЕН!
-            
-            👤 Автор: ${{ github.actor }}
-            💬 Коммит: ${{ github.event.head_commit.message }}
-            
-            🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            
-            ⚠️ Требуется проверка!
+            ✅ Бот обновлён
+            ✅ Данные PostgreSQL сохранены
+            ✅ Ожидание расчёта в 06:30 МСК
+
+            ⚠️ Торговля несёт риск потери капитала

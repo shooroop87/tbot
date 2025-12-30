@@ -1,5 +1,5 @@
-# Tinkoff Invest API
-tinkoff-investments==0.2.0-beta93
+# T-Invest API (новый пакет, бывший tinkoff-investments)
+t-tech-investments>=0.2.0b118
 
 # Database
 sqlalchemy==2.0.23

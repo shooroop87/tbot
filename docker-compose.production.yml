@@ -1,102 +1,112 @@
-version: '3.8'
-
-# ═══════════════════════════════════════════════════════════
-# Trading Bot - Production Docker Compose
-# ⚠️ Торговля несёт риск потери капитала
-# ═══════════════════════════════════════════════════════════
+volumes:
+  pg_data:
+  bot_logs:
 
 services:
   # ─────────────────────────────────────────────────────────
   # PostgreSQL - База данных
   # ─────────────────────────────────────────────────────────
-  postgres:
+  db:
     image: postgres:15-alpine
-    container_name: trading_postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-trading_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-trader}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
-      # Оптимизации для SSD
-      POSTGRES_INITDB_ARGS: "--data-checksums"
+    env_file: .env
     volumes:
-      # ⚠️ ВАЖНО: Named volume сохраняет данные между деплоями
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "127.0.0.1:5432:5432"  # Только localhost
+      - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-trading_bot}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    # Graceful shutdown
-    stop_grace_period: 30s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tbot_user}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
 
   # ─────────────────────────────────────────────────────────
   # Trading Bot - Основной сервис
   # ─────────────────────────────────────────────────────────
   bot:
-    image: ${DOCKER_IMAGE:-trading_bot}:${DOCKER_TAG:-latest}
-    container_name: trading_bot
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
+    image: egorovdocker/tbot_backend:latest
+    env_file: .env
     environment:
-      # Tinkoff API
-      TINKOFF_TOKEN: ${TINKOFF_TOKEN:?TINKOFF_TOKEN is required}
-      TINKOFF_ACCOUNT_ID: ${TINKOFF_ACCOUNT_ID:-}
-      
-      # Telegram
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is required}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID is required}
-      
-      # Database
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-trading_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-trader}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      
-      # Trading
-      DEPOSIT_RUB: ${DEPOSIT_RUB:-1000000}
-      RISK_PER_TRADE_PCT: ${RISK_PER_TRADE_PCT:-0.01}
-      MAX_POSITION_PCT: ${MAX_POSITION_PCT:-0.25}
+      - POSTGRES_HOST=db
     volumes:
-      # Конфиг (read-only)
       - ./config.yaml:/app/config.yaml:ro
-      # Логи
       - bot_logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
       interval: 60s
       timeout: 10s
       retries: 3
-      start_period: 30s
-    # Graceful shutdown - ждём завершения текущих операций
-    stop_grace_period: 60s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "5"
+    restart: unless-stopped
 
-# ─────────────────────────────────────────────────────────
-# Volumes - Сохраняются между деплоями!
-# ─────────────────────────────────────────────────────────
-volumes:
-  # ⚠️ НЕ УДАЛЯТЬ - содержит все данные БД
-  postgres_data:
-    name: trading_postgres_data
-  
-  # Логи бота
-  bot_logs:
-    name: trading_bot_logs
+  # ═══════════════════════════════════════════════════════════
+  # СЕРВИСЫ ОБСЛУЖИВАНИЯ (запуск вручную)
+  # ═══════════════════════════════════════════════════════════
 
-# ─────────────────────────────────────────────────────────
-# Networks
-# ─────────────────────────────────────────────────────────
-networks:
-  default:
-    name: trading_network
+  # Бэкап базы данных
+  # Запуск: sudo docker compose -f docker-compose.production.yml --profile maintenance run --rm db-backup
+  db-backup:
+    image: postgres:15-alpine
+    env_file: .env
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    profiles: ["maintenance"]
+    command: >
+      sh -c "
+        echo 'Creating database backup...' &&
+        PGPASSWORD=$$POSTGRES_PASSWORD pg_dump -h db -U $$POSTGRES_USER $$POSTGRES_DB > /backups/backup_$$(date +%Y%m%d_%H%M%S).sql &&
+        echo 'Database backup created' &&
+        find /backups -name 'backup_*.sql' -mtime +7 -delete &&
+        echo 'Old backups cleaned up'
+      "
+
+  # Очистка Docker системы
+  docker-cleaner:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: "no"
+    profiles: ["maintenance"]
+    command: >
+      sh -c "
+        echo 'Cleaning Docker system...' &&
+        docker system prune -f &&
+        docker image prune -f &&
+        echo 'Docker system cleaned'
+      "
+
+  # Мониторинг ресурсов
+  system-monitor:
+    image: alpine:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: "no"
+    profiles: ["monitoring"]
+    command: >
+      sh -c "
+        apk add --no-cache docker-cli &&
+        echo '=== System Resource Usage ===' &&
+        docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}' &&
+        echo '' &&
+        echo '=== Volume Usage ===' &&
+        docker system df -v | grep -E '(VOLUME NAME|tbot)' || true
+      "
+
+  # Очистка логов
+  logs-cleaner:
+    image: alpine:latest
+    volumes:
+      - bot_logs:/app/logs
+    restart: "no"
+    profiles: ["maintenance"]
+    command: >
+      sh -c "
+        echo 'Cleaning old logs...' &&
+        find /app/logs -name '*.log' -mtime +30 -delete 2>/dev/null || true &&
+        find /app/logs -name '*.log.*' -mtime +7 -delete 2>/dev/null || true &&
+        echo 'Logs cleanup completed'
+      "
