@@ -173,10 +173,25 @@ class TelegramNotifier:
         lines = [
             f"<b>💵 Фьючерс {futures['ticker']}</b>",
             f"   Цена: {futures['price']:,.0f}",
-            f"   ATR: {futures['atr']:.0f}",
-            f"   BB нижняя: {futures['bb_lower']:,.0f}",
-            f"   Экспирация: {futures['expiration']}",
+            f"   📊 ATR: {futures.get('atr', 0):,.0f} ({futures.get('atr_pct', 0):.1f}%)",
+            f"   📉 BB нижняя: {futures['bb_lower']:,.0f}",
+            "",
         ]
+        
+        # R:R параметры если есть
+        if futures.get('entry_price'):
+            lines.extend([
+                f"   <b>R:R 1:3 параметры:</b>",
+                f"   📥 Вход: {futures['entry_price']:,.0f}",
+                f"   🎯 Тейк (+{futures.get('take_offset', 0):,.0f}): {futures.get('take_price', 0):,.0f}",
+                f"   🛑 Стоп (-{futures.get('stop_offset', 0):,.0f}): {futures.get('stop_price', 0):,.0f}",
+                "",
+                f"   📦 Позиция: {futures.get('position_size', 0):,} шт ({futures.get('position_value', 0):,.0f} ₽)",
+                f"   💸 Потенц. убыток: {futures.get('potential_loss', 0):,.0f} ₽",
+                f"   💰 Потенц. прибыль: {futures.get('potential_profit', 0):,.0f} ₽",
+            ])
+        
+        lines.append(f"   📅 Экспирация: {futures['expiration']}")
         
         text = "\n".join(lines)
         

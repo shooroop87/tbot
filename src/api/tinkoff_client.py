@@ -74,8 +74,8 @@ class TinkoffClient:
 
         shares = []
         for share in response.instruments:
-            # Только российские акции с MOEX
-            if share.exchange == "MOEX" and share.currency == "rub":
+            # RUB акции с любой MOEX-биржи
+            if share.currency == "rub" and "moex" in share.exchange.lower():
                 shares.append({
                     "figi": share.figi,
                     "ticker": share.ticker,

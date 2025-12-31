@@ -83,7 +83,10 @@ class DailyCalculationJob:
                 )
                 
                 # 4. Обновляем кэш для кнопок Telegram
-                update_shares_cache(report["top_shares"])
+                all_for_cache = report["top_shares"].copy()
+                if report["futures_si"]:
+                    all_for_cache.append(report["futures_si"])
+                update_shares_cache(all_for_cache)
 
         except Exception as e:
             logger.exception("daily_calculation_error")
@@ -286,7 +289,7 @@ class DailyCalculationJob:
         }
 
     async def _analyze_futures_si(self, client: TinkoffClient) -> Optional[Dict]:
-        """Анализирует фьючерс Si."""
+        """Анализирует фьючерс Si с R:R 1:3."""
         logger.info("analyzing_futures_si")
         
         si_future = await client.get_futures_by_ticker("Si")
@@ -313,15 +316,48 @@ class DailyCalculationJob:
             return None
         
         price = await client.get_last_price(si_future["figi"]) or indicators["close"]
+        atr = indicators["atr"]
+        bb_lower = indicators["bb_lower"]
+        
+        # === R:R 1:3 для Si ===
+        entry_price = bb_lower
+        take_profit_offset = 0.5 * atr
+        take_price = entry_price + take_profit_offset
+        stop_loss_offset = take_profit_offset / 3
+        stop_price = entry_price - stop_loss_offset
+        
+        # Позиция: 100к / цена
+        lot_size = si_future.get("lot", 1)
+        position_size = int(ORDER_AMOUNT_RUB / entry_price) if entry_price > 0 else 0
+        position_size = (position_size // lot_size) * lot_size
+        position_value = position_size * entry_price
+        potential_loss = position_size * stop_loss_offset
+        potential_profit = position_size * take_profit_offset
         
         logger.info("si_analyzed", ticker=si_future["ticker"], price=price,
-                   atr=indicators["atr"], bb_lower=indicators["bb_lower"])
+                   atr=round(atr, 0), bb_lower=round(bb_lower, 0),
+                   entry=round(entry_price, 0))
         
         return {
             "ticker": si_future["ticker"],
             "figi": si_future["figi"],
+            "lot_size": lot_size,
             "price": round(price, 0),
-            "atr": round(indicators["atr"], 0),
-            "bb_lower": round(indicators["bb_lower"], 0),
+            "atr": round(atr, 0),
+            "atr_pct": round(atr / price * 100, 2) if price > 0 else 0,
+            "bb_lower": round(bb_lower, 0),
+            "bb_middle": round(indicators["bb_middle"], 0),
+            "bb_upper": round(indicators["bb_upper"], 0),
+            # R:R 1:3 параметры
+            "entry_price": round(entry_price, 0),
+            "take_price": round(take_price, 0),
+            "stop_price": round(stop_price, 0),
+            "stop_offset": round(stop_loss_offset, 0),
+            "take_offset": round(take_profit_offset, 0),
+            # Позиция
+            "position_size": position_size,
+            "position_value": round(position_value, 0),
+            "potential_loss": round(potential_loss, 0),
+            "potential_profit": round(potential_profit, 0),
             "expiration": si_future["expiration"].strftime("%Y-%m-%d"),
         }

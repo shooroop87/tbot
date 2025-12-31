@@ -47,7 +47,7 @@ risk:
 
 # Безопасность
 safety:
-  dry_run: true                   # true = без реальных сделок
+  dry_run: false                  # true = без реальных сделок
   kill_switch: false              # Аварийная остановка
 
 # Расписание
