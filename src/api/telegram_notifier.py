@@ -109,7 +109,7 @@ class TelegramNotifier:
         # Отправляем каждую акцию отдельным сообщением с кнопкой
         top_shares = report.get("top_shares", [])
         if top_shares:
-            for share in top_shares[:10]:
+            for share in top_shares:  # Показываем все акции
                 await self._send_share_card(share)
                 await asyncio.sleep(0.3)  # Пауза между сообщениями
         else:
