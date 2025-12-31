@@ -40,18 +40,17 @@ class TinkoffClient:
 
     async def __aenter__(self) -> "TinkoffClient":
         """Вход в async context."""
-        self._client = await AsyncClient(
+        self._client = AsyncClient(
             token=self.token,
-            target=INVEST_GRPC_API  # Боевой контур: invest-public-api.tbank.ru:443
-        ).__aenter__()
+            target=INVEST_GRPC_API
+        )
         logger.info("tinkoff_client_connected", target="prod")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Выход из async context."""
-        if self._client:
-            await self._client.__aexit__(exc_type, exc_val, exc_tb)
-            logger.info("tinkoff_client_disconnected")
+        self._client = None
+        logger.info("tinkoff_client_disconnected")
 
     # ═══════════════════════════════════════════════════════════
     # Инструменты
