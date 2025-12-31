@@ -15,24 +15,14 @@ from config import Config
 from api.tinkoff_client import TinkoffClient
 from api.telegram_notifier import TelegramNotifier
 from db.repository import Repository
-from strategy.bollinger_bounce import BollingerBounceStrategy
+from indicators.daily_aggregator import aggregate_hourly_to_daily, calculate_indicators
 
 logger = structlog.get_logger()
 MSK = pytz.timezone("Europe/Moscow")
 
 
 class DailyCalculationJob:
-    """
-    Ежедневный расчёт индикаторов.
-    
-    Выполняет:
-    1. Получение ликвидных акций
-    2. Загрузка свечей
-    3. Расчёт ATR, Bollinger
-    4. Генерация сигналов
-    5. Сохранение в БД
-    6. Отправка отчёта в Telegram
-    """
+    """Ежедневный расчёт индикаторов."""
 
     def __init__(
         self,
@@ -43,21 +33,6 @@ class DailyCalculationJob:
         self.config = config
         self.repo = repository
         self.notifier = notifier
-        
-        # Инициализация стратегии
-        self.strategy = BollingerBounceStrategy({
-            "bollinger_period": config.bollinger.period,
-            "bollinger_std": config.bollinger.std_multiplier,
-            "atr_period": config.atr.period,
-            "entry_threshold_pct": config.bollinger.entry_threshold_pct,
-            "stop_loss_atr": config.risk.stop_loss_atr,
-            "take_profit_atr": config.risk.take_profit_atr,
-            "deposit": config.trading.deposit_rub,
-            "risk_per_trade": config.trading.risk_per_trade_pct,
-            "max_position_pct": config.risk.max_position_pct,
-            "trading_start_hour": int(config.trading_hours.start.split(":")[0]),
-            "trading_end_hour": int(config.trading_hours.end.split(":")[0]),
-        })
 
     async def run(self):
         """Запускает ежедневный расчёт."""
@@ -65,9 +40,8 @@ class DailyCalculationJob:
         
         now_msk = datetime.now(MSK)
         
-        # Проверка: выходной?
         if now_msk.weekday() >= 5:
-            logger.info("skipping_weekend", day=now_msk.strftime("%A"))
+            logger.info("skipping_weekend")
             await self.notifier.send_message("📅 Выходной день, расчёт пропущен")
             return
         
@@ -77,29 +51,29 @@ class DailyCalculationJob:
             "risk_pct": self.config.trading.risk_per_trade_pct * 100,
             "dry_run": self.config.dry_run,
             "top_shares": [],
+            "liquid_shares": [],
             "futures_si": None,
             "liquid_count": 0,
         }
 
         try:
             async with TinkoffClient(self.config.tinkoff) as client:
-                # 1. Получаем ликвидные акции
+                # 1. Ликвидные акции
                 liquid_shares = await self._get_liquid_shares(client)
                 report["liquid_count"] = len(liquid_shares)
+                report["liquid_shares"] = [s["ticker"] for s in liquid_shares]
                 
-                # 2. Анализируем каждую акцию
-                for share in liquid_shares[:15]:  # Топ-15
+                # 2. Анализ акций
+                for share in liquid_shares[:15]:
                     result = await self._analyze_share(client, share)
                     if result:
                         report["top_shares"].append(result)
-                        await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.3)
                 
                 # 3. Фьючерс Si
-                futures_si = await self._analyze_futures_si(client)
-                if futures_si:
-                    report["futures_si"] = futures_si
+                report["futures_si"] = await self._analyze_futures_si(client)
                 
-                # Сортируем: сначала с сигналом BUY
+                # Сортировка: сначала BUY, потом по distance
                 report["top_shares"].sort(
                     key=lambda x: (x.get("signal") != "BUY", x.get("distance_to_bb_pct", 100))
                 )
@@ -109,90 +83,80 @@ class DailyCalculationJob:
             await self.notifier.send_error(str(e), "Ежедневный расчёт")
             return
 
-        # 4. Отправляем отчёт
         logger.info("sending_report", shares=len(report["top_shares"]))
         await self.notifier.send_daily_report(report)
-        
         logger.info("daily_calculation_complete")
 
     async def _get_liquid_shares(self, client: TinkoffClient) -> List[Dict[str, Any]]:
-        """Получает ликвидные акции."""
+        """Получает ликвидные акции (проверяем ВСЕ, сортируем по объёму)."""
         logger.info("fetching_liquid_shares")
         
         all_shares = await client.get_shares()
-        liquid_shares = []
+        logger.info("total_shares", count=len(all_shares))
         
-        for share in all_shares[:self.config.liquidity.max_instruments]:
-            figi = share["figi"]
+        # Шаг 1: Собираем объёмы для ВСЕХ акций
+        shares_with_volume = []
+        for i, share in enumerate(all_shares):
+            if i % 20 == 0:
+                logger.info("volume_check_progress", checked=i, total=len(all_shares))
             
             try:
-                # Проверяем объём
-                volume_data = await self._calculate_avg_volume(client, figi)
-                if not volume_data:
-                    continue
-                    
-                if volume_data["avg_volume_rub"] < self.config.liquidity.min_avg_volume_rub:
-                    continue
-                
-                # Проверяем спред
-                orderbook = await client.get_orderbook(figi)
+                volume_data = await self._calculate_avg_volume(client, share["figi"])
+                if volume_data and volume_data["avg_volume_rub"] >= self.config.liquidity.min_avg_volume_rub:
+                    shares_with_volume.append({**share, **volume_data})
+                    logger.debug("volume_passed", ticker=share["ticker"], 
+                               volume_mln=round(volume_data["avg_volume_rub"] / 1_000_000, 1))
+            except Exception as e:
+                logger.error("volume_check_error", ticker=share["ticker"], error=str(e))
+            
+            await asyncio.sleep(0.15)
+        
+        # Сортируем по объёму (самые ликвидные сверху)
+        shares_with_volume.sort(key=lambda x: x["avg_volume_rub"], reverse=True)
+        logger.info("volume_check_complete", passed=len(shares_with_volume))
+        
+        # Шаг 2: Проверяем спред только для топ-N по объёму
+        liquid_shares = []
+        check_count = min(len(shares_with_volume), self.config.liquidity.max_instruments * 2)
+        
+        for share in shares_with_volume[:check_count]:
+            try:
+                orderbook = await client.get_orderbook(share["figi"])
                 if not orderbook:
                     continue
-                    
                 if orderbook["spread_pct"] > self.config.liquidity.max_spread_pct:
+                    logger.debug("spread_too_high", ticker=share["ticker"], spread=orderbook["spread_pct"])
                     continue
-                
-                # Сохраняем в БД
-                await self.repo.upsert_instrument({
-                    "figi": figi,
-                    "ticker": share["ticker"],
-                    "name": share["name"],
-                    "instrument_type": "share",
-                    "lot_size": share.get("lot", 1),
-                    "avg_volume_rub": volume_data["avg_volume_rub"],
-                    "spread_pct": orderbook["spread_pct"],
-                    "is_liquid": True,
-                })
                 
                 liquid_shares.append({
                     **share,
-                    "avg_volume_rub": volume_data["avg_volume_rub"],
                     "spread_pct": orderbook["spread_pct"],
                     "last_price": orderbook["mid_price"],
                 })
                 
-                logger.info(
-                    "liquid_share_found",
-                    ticker=share["ticker"],
-                    volume_mln=round(volume_data["avg_volume_rub"] / 1_000_000, 1)
-                )
+                logger.info("liquid_share_found", ticker=share["ticker"],
+                           volume_mln=round(share["avg_volume_rub"] / 1_000_000, 1),
+                           spread=round(orderbook["spread_pct"], 3))
                 
-                await asyncio.sleep(0.3)
-                
+                if len(liquid_shares) >= self.config.liquidity.max_instruments:
+                    break
+                    
             except Exception as e:
-                logger.error("liquidity_check_error", ticker=share["ticker"], error=str(e))
-        
-        # Сортируем по объёму
-        liquid_shares.sort(key=lambda x: x["avg_volume_rub"], reverse=True)
+                logger.error("spread_check_error", ticker=share["ticker"], error=str(e))
+            
+            await asyncio.sleep(0.15)
         
         logger.info("liquidity_analysis_complete", count=len(liquid_shares))
         return liquid_shares
 
-    async def _calculate_avg_volume(
-        self, 
-        client: TinkoffClient, 
-        figi: str
-    ) -> Optional[Dict[str, Any]]:
+    async def _calculate_avg_volume(self, client: TinkoffClient, figi: str) -> Optional[Dict]:
         """Рассчитывает средний дневной объём."""
         days = self.config.liquidity.lookback_days
         
-        to_dt = datetime.utcnow()
-        from_dt = to_dt - timedelta(days=days + 5)
-        
         candles = await client.get_candles(
             figi=figi,
-            from_dt=from_dt,
-            to_dt=to_dt,
+            from_dt=datetime.utcnow() - timedelta(days=days + 5),
+            to_dt=datetime.utcnow(),
             interval=CandleInterval.CANDLE_INTERVAL_DAY
         )
         
@@ -200,34 +164,24 @@ class DailyCalculationJob:
             return None
         
         volumes_rub = [c["volume"] * c["close"] for c in candles[-days:]]
-        
         if not volumes_rub:
             return None
         
-        return {
-            "avg_volume_rub": sum(volumes_rub) / len(volumes_rub),
-            "days_analyzed": len(volumes_rub),
-        }
+        return {"avg_volume_rub": sum(volumes_rub) / len(volumes_rub)}
 
-    async def _analyze_share(
-        self, 
-        client: TinkoffClient, 
-        share: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Анализирует акцию и возвращает данные для отчёта."""
+    async def _analyze_share(self, client: TinkoffClient, share: Dict) -> Optional[Dict]:
+        """Анализирует акцию."""
         figi = share["figi"]
         ticker = share["ticker"]
+        lot_size = share.get("lot", 1)
         
         logger.info("analyzing_share", ticker=ticker)
         
-        # Загружаем часовые свечи за 35 дней
-        from_dt = datetime.utcnow() - timedelta(days=35)
-        to_dt = datetime.utcnow()
-        
+        # ЧАСОВЫЕ свечи за 35 дней
         candles = await client.get_candles(
             figi=figi,
-            from_dt=from_dt,
-            to_dt=to_dt,
+            from_dt=datetime.utcnow() - timedelta(days=35),
+            to_dt=datetime.utcnow(),
             interval=CandleInterval.CANDLE_INTERVAL_HOUR
         )
         
@@ -235,76 +189,98 @@ class DailyCalculationJob:
             logger.warning("no_candles", ticker=ticker)
             return None
         
-        # Текущая цена
-        current_price = share.get("last_price") or candles[-1]["close"]
-        
-        # Анализ стратегией
-        analysis = self.strategy.analyze(
-            ticker=ticker,
-            figi=figi,
-            candles=candles,
-            current_price=current_price,
-            lot_size=share.get("lot", 1),
-        )
-        
-        if not analysis:
+        # Агрегация в дневные (10-19 МСК)
+        daily_df = aggregate_hourly_to_daily(candles)
+        if daily_df.empty or len(daily_df) < 20:
+            logger.warning("insufficient_daily", ticker=ticker, days=len(daily_df))
             return None
         
-        # Сохраняем индикаторы в БД
-        instrument = await self.repo.get_instrument_by_figi(figi)
-        if instrument:
-            await self.repo.save_daily_indicator({
-                "instrument_id": instrument.id,
-                "date": datetime.now(MSK).replace(tzinfo=None),
-                "last_price": current_price,
-                "atr": analysis.atr,
-                "atr_pct": analysis.atr_pct,
-                "bb_upper": analysis.bb_upper,
-                "bb_middle": analysis.bb_middle,
-                "bb_lower": analysis.bb_lower,
-                "recommended_size": analysis.position_size,
-                "stop_rub": analysis.stop_rub,
-                "max_loss_rub": analysis.max_loss,
-            })
-            
-            # Сохраняем сигнал если есть
-            if analysis.signal:
-                await self.repo.save_signal({
-                    "instrument_id": instrument.id,
-                    "signal_type": analysis.signal.type.value,
-                    "signal_time": analysis.signal.timestamp,
-                    "price": analysis.signal.price,
-                    "target_price": analysis.signal.target_price,
-                    "stop_price": analysis.signal.stop_price,
-                    "position_size": analysis.signal.position_size,
-                    "strategy": analysis.signal.strategy_name,
-                    "reason": analysis.signal.reason,
-                    "confidence": analysis.signal.confidence,
-                })
+        # Индикаторы
+        indicators = calculate_indicators(daily_df)
+        if not indicators:
+            return None
+        
+        current_price = share.get("last_price") or indicators["close"]
+        atr = indicators["atr"]
+        bb_lower = indicators["bb_lower"]
+        
+        # Расстояние до BB
+        distance_to_bb_pct = (current_price - bb_lower) / current_price * 100 if current_price > 0 else 0
+        
+        # === РАСЧЁТ ПОЗИЦИИ С ОГРАНИЧЕНИЯМИ ===
+        deposit = self.config.trading.deposit_rub
+        risk_per_trade = self.config.trading.risk_per_trade_pct
+        max_position_pct = self.config.risk.max_position_pct
+        stop_loss_atr = self.config.risk.stop_loss_atr
+        
+        # Стоп-лосс в рублях на 1 акцию
+        stop_rub = atr * stop_loss_atr
+        
+        # Максимальный убыток на сделку
+        max_loss = deposit * risk_per_trade
+        
+        # Размер по риску: сколько акций можно купить при данном стопе
+        if stop_rub > 0.001:
+            position_by_risk = int(max_loss / stop_rub)
+        else:
+            position_by_risk = 0
+        
+        # Размер по капиталу: максимум 25% депозита
+        max_position_value = deposit * max_position_pct
+        if current_price > 0:
+            position_by_capital = int(max_position_value / current_price)
+        else:
+            position_by_capital = 0
+        
+        # Берём МИНИМУМ из двух ограничений
+        position_size = min(position_by_risk, position_by_capital)
+        
+        # Округляем до лотов
+        position_size = (position_size // lot_size) * lot_size
+        
+        # Итоговая стоимость позиции
+        position_value = position_size * current_price
+        
+        # Фактический риск
+        actual_loss = position_size * stop_rub
+        
+        # Сигнал
+        signal = "BUY" if distance_to_bb_pct <= self.config.bollinger.entry_threshold_pct else None
+        
+        logger.info("share_analyzed", 
+                   ticker=ticker, 
+                   price=round(current_price, 2),
+                   atr=round(atr, 2), 
+                   bb_lower=round(bb_lower, 2), 
+                   distance=round(distance_to_bb_pct, 2), 
+                   position=position_size,
+                   position_value=round(position_value, 0),
+                   signal=signal)
         
         return {
             "ticker": ticker,
             "price": current_price,
-            "atr": analysis.atr,
-            "atr_pct": analysis.atr_pct,
-            "bb_lower": analysis.bb_lower,
-            "bb_upper": analysis.bb_upper,
-            "position_size": analysis.position_size,
-            "position_value": analysis.position_value,
-            "stop_rub": analysis.stop_rub,
-            "max_loss": analysis.max_loss,
-            "distance_to_bb_pct": analysis.distance_to_bb_pct,
-            "signal": analysis.signal.type.value if analysis.signal else None,
+            "atr": atr,
+            "atr_pct": round(atr / current_price * 100, 2) if current_price > 0 else 0,
+            "bb_lower": bb_lower,
+            "bb_upper": indicators["bb_upper"],
+            "position_size": position_size,
+            "position_value": round(position_value, 0),
+            "stop_rub": stop_rub,
+            "max_loss": round(actual_loss, 0),
+            "distance_to_bb_pct": round(distance_to_bb_pct, 2),
+            "signal": signal,
         }
 
-    async def _analyze_futures_si(self, client: TinkoffClient) -> Optional[Dict[str, Any]]:
+    async def _analyze_futures_si(self, client: TinkoffClient) -> Optional[Dict]:
         """Анализирует фьючерс Si."""
         logger.info("analyzing_futures_si")
         
-        si_future = await client.get_next_futures("USD")
+        si_future = await client.get_futures_by_ticker("Si")
         if not si_future:
             return None
         
+        # ЧАСОВЫЕ свечи
         candles = await client.get_candles(
             figi=si_future["figi"],
             from_dt=datetime.utcnow() - timedelta(days=35),
@@ -315,23 +291,23 @@ class DailyCalculationJob:
         if not candles:
             return None
         
-        price = await client.get_last_price(si_future["figi"]) or candles[-1]["close"]
-        
-        analysis = self.strategy.analyze(
-            ticker=si_future["ticker"],
-            figi=si_future["figi"],
-            candles=candles,
-            current_price=price,
-            lot_size=si_future.get("lot", 1),
-        )
-        
-        if not analysis:
+        daily_df = aggregate_hourly_to_daily(candles)
+        if daily_df.empty or len(daily_df) < 20:
             return None
+        
+        indicators = calculate_indicators(daily_df)
+        if not indicators:
+            return None
+        
+        price = await client.get_last_price(si_future["figi"]) or indicators["close"]
+        
+        logger.info("si_analyzed", ticker=si_future["ticker"], price=price,
+                   atr=indicators["atr"], bb_lower=indicators["bb_lower"])
         
         return {
             "ticker": si_future["ticker"],
-            "price": price,
-            "atr": analysis.atr,
-            "bb_lower": analysis.bb_lower,
+            "price": round(price, 0),
+            "atr": round(indicators["atr"], 0),
+            "bb_lower": round(indicators["bb_lower"], 0),
             "expiration": si_future["expiration"].strftime("%Y-%m-%d"),
         }

@@ -5,6 +5,7 @@ t-tech-investments>=0.2.0b118
 sqlalchemy==2.0.23
 asyncpg==0.29.0
 alembic==1.13.1
+greenlet>=3.0.0
 
 # Async
 aiohttp==3.9.1
