@@ -88,7 +88,8 @@ jobs:
         with:
           context: .
           push: true
-          tags: egorovdocker/tbot_backend:latest
+          platforms: linux/amd64
+          tags: ${{ secrets.DOCKER_USERNAME }}/trading_bot:latest
 
   # ═══════════════════════════════════════════════════════════
   # 3. Деплой на сервер
@@ -123,6 +124,10 @@ jobs:
             set -e
 
             cd tbot
+
+            echo "📝 Ensuring DOCKER_IMAGE in .env..."
+            grep -q "^DOCKER_IMAGE=" .env || echo "DOCKER_IMAGE=${{ secrets.DOCKER_USERNAME }}/trading_bot" >> .env
+            grep -q "^DOCKER_TAG=" .env || echo "DOCKER_TAG=latest" >> .env
 
             echo "🔐 Login to Docker Hub..."
             echo "${{ secrets.DOCKERHUB_TOKEN_RO }}" | sudo docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
