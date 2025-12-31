@@ -14,15 +14,19 @@ from t_tech.invest import CandleInterval
 from config import Config
 from api.tinkoff_client import TinkoffClient
 from api.telegram_notifier import TelegramNotifier
+from api.telegram_bot import update_shares_cache
 from db.repository import Repository
 from indicators.daily_aggregator import aggregate_hourly_to_daily, calculate_indicators
 
 logger = structlog.get_logger()
 MSK = pytz.timezone("Europe/Moscow")
 
+# Сумма заявки по умолчанию
+ORDER_AMOUNT_RUB = 100_000
+
 
 class DailyCalculationJob:
-    """Ежедневный расчёт индикаторов."""
+    """Ежедневный расчёт индикаторов с R:R 1:3."""
 
     def __init__(
         self,
@@ -58,12 +62,12 @@ class DailyCalculationJob:
 
         try:
             async with TinkoffClient(self.config.tinkoff) as client:
-                # 1. Ликвидные акции
+                # 1. Ликвидные акции (проверяем ВСЕ)
                 liquid_shares = await self._get_liquid_shares(client)
                 report["liquid_count"] = len(liquid_shares)
                 report["liquid_shares"] = [s["ticker"] for s in liquid_shares]
                 
-                # 2. Анализ акций
+                # 2. Анализ акций с R:R 1:3
                 for share in liquid_shares[:15]:
                     result = await self._analyze_share(client, share)
                     if result:
@@ -77,6 +81,9 @@ class DailyCalculationJob:
                 report["top_shares"].sort(
                     key=lambda x: (x.get("signal") != "BUY", x.get("distance_to_bb_pct", 100))
                 )
+                
+                # 4. Обновляем кэш для кнопок Telegram
+                update_shares_cache(report["top_shares"])
 
         except Exception as e:
             logger.exception("daily_calculation_error")
@@ -170,7 +177,7 @@ class DailyCalculationJob:
         return {"avg_volume_rub": sum(volumes_rub) / len(volumes_rub)}
 
     async def _analyze_share(self, client: TinkoffClient, share: Dict) -> Optional[Dict]:
-        """Анализирует акцию."""
+        """Анализирует акцию с R:R 1:3."""
         figi = share["figi"]
         ticker = share["ticker"]
         lot_size = share.get("lot", 1)
@@ -203,71 +210,77 @@ class DailyCalculationJob:
         current_price = share.get("last_price") or indicators["close"]
         atr = indicators["atr"]
         bb_lower = indicators["bb_lower"]
+        bb_middle = indicators["bb_middle"]
         
-        # Расстояние до BB
+        # Расстояние до BB Lower
         distance_to_bb_pct = (current_price - bb_lower) / current_price * 100 if current_price > 0 else 0
         
-        # === РАСЧЁТ ПОЗИЦИИ С ОГРАНИЧЕНИЯМИ ===
-        deposit = self.config.trading.deposit_rub
-        risk_per_trade = self.config.trading.risk_per_trade_pct
-        max_position_pct = self.config.risk.max_position_pct
-        stop_loss_atr = self.config.risk.stop_loss_atr
+        # === R:R 1:3 РАСЧЁТ ===
+        # Вход = BB Lower (отложенная заявка)
+        entry_price = bb_lower
         
-        # Стоп-лосс в рублях на 1 акцию
-        stop_rub = atr * stop_loss_atr
+        # Тейк = 0.5 ATR от входа (реалистичное внутридневное движение)
+        take_profit_offset = 0.5 * atr
+        take_price = entry_price + take_profit_offset
         
-        # Максимальный убыток на сделку
-        max_loss = deposit * risk_per_trade
+        # Стоп = Reward / 3 для R:R 1:3
+        reward = take_profit_offset  # 0.5 ATR
+        stop_loss_offset = reward / 3  # ~0.167 ATR
+        stop_price = entry_price - stop_loss_offset
         
-        # Размер по риску: сколько акций можно купить при данном стопе
-        if stop_rub > 0.001:
-            position_by_risk = int(max_loss / stop_rub)
+        # === РАСЧЁТ ПОЗИЦИИ ===
+        # Размер позиции по сумме заявки
+        if entry_price > 0:
+            position_size = int(ORDER_AMOUNT_RUB / entry_price)
         else:
-            position_by_risk = 0
-        
-        # Размер по капиталу: максимум 25% депозита
-        max_position_value = deposit * max_position_pct
-        if current_price > 0:
-            position_by_capital = int(max_position_value / current_price)
-        else:
-            position_by_capital = 0
-        
-        # Берём МИНИМУМ из двух ограничений
-        position_size = min(position_by_risk, position_by_capital)
+            position_size = 0
         
         # Округляем до лотов
         position_size = (position_size // lot_size) * lot_size
         
-        # Итоговая стоимость позиции
-        position_value = position_size * current_price
+        # Стоимость позиции
+        position_value = position_size * entry_price
         
-        # Фактический риск
-        actual_loss = position_size * stop_rub
+        # Потенциальный убыток и прибыль
+        potential_loss = position_size * stop_loss_offset
+        potential_profit = position_size * take_profit_offset
         
-        # Сигнал
+        # Сигнал BUY если цена близко к BB Lower
         signal = "BUY" if distance_to_bb_pct <= self.config.bollinger.entry_threshold_pct else None
         
         logger.info("share_analyzed", 
                    ticker=ticker, 
                    price=round(current_price, 2),
+                   entry=round(entry_price, 2),
+                   take=round(take_price, 2),
+                   stop=round(stop_price, 2),
                    atr=round(atr, 2), 
                    bb_lower=round(bb_lower, 2), 
                    distance=round(distance_to_bb_pct, 2), 
                    position=position_size,
-                   position_value=round(position_value, 0),
                    signal=signal)
         
         return {
             "ticker": ticker,
+            "figi": figi,
+            "lot_size": lot_size,
             "price": current_price,
             "atr": atr,
             "atr_pct": round(atr / current_price * 100, 2) if current_price > 0 else 0,
             "bb_lower": bb_lower,
+            "bb_middle": bb_middle,
             "bb_upper": indicators["bb_upper"],
+            # R:R 1:3 параметры
+            "entry_price": round(entry_price, 2),
+            "take_price": round(take_price, 2),
+            "stop_price": round(stop_price, 2),
+            "stop_offset": round(stop_loss_offset, 2),
+            "take_offset": round(take_profit_offset, 2),
+            # Позиция
             "position_size": position_size,
             "position_value": round(position_value, 0),
-            "stop_rub": stop_rub,
-            "max_loss": round(actual_loss, 0),
+            "potential_loss": round(potential_loss, 0),
+            "potential_profit": round(potential_profit, 0),
             "distance_to_bb_pct": round(distance_to_bb_pct, 2),
             "signal": signal,
         }
@@ -306,6 +319,7 @@ class DailyCalculationJob:
         
         return {
             "ticker": si_future["ticker"],
+            "figi": si_future["figi"],
             "price": round(price, 0),
             "atr": round(indicators["atr"], 0),
             "bb_lower": round(indicators["bb_lower"], 0),

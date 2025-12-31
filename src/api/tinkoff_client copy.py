@@ -36,8 +36,8 @@ class TinkoffClient:
     def __init__(self, config: TinkoffConfig):
         self.token = config.token
         self.account_id = config.account_id
-        self._async_client: Optional[AsyncClient] = None  # Для управления lifecycle
-        self._services = None  # Сервисы API
+        self._async_client: Optional[AsyncClient] = None
+        self._services = None
 
     async def __aenter__(self) -> "TinkoffClient":
         """Вход в async context."""
@@ -62,20 +62,15 @@ class TinkoffClient:
     # ═══════════════════════════════════════════════════════════
 
     async def get_shares(self) -> List[Dict[str, Any]]:
-        """
-        Получает список всех акций на MOEX.
-        
-        Returns:
-            Список словарей с данными акций
-        """
+        """Получает список всех акций на MOEX."""
         response: SharesResponse = await self._services.instruments.shares(
             instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
         )
 
         shares = []
         for share in response.instruments:
-            # Только российские акции с MOEX
-            if share.exchange == "MOEX" and share.currency == "rub":
+            # RUB акции с любой MOEX-биржи
+            if share.currency == "rub" and "moex" in share.exchange.lower():
                 shares.append({
                     "figi": share.figi,
                     "ticker": share.ticker,
@@ -88,83 +83,6 @@ class TinkoffClient:
 
         logger.info("shares_loaded", count=len(shares))
         return shares
-
-    async def get_futures_by_base_asset(
-        self, 
-        base_asset: str = "USD",
-        skip_current_month: bool = True
-    ) -> List[Dict[str, Any]]:
-        """
-        Получает фьючерсы по базовому активу.
-        
-        Args:
-            base_asset: Базовый актив (USD, EUR, RTS, etc)
-            skip_current_month: Пропускать текущий месяц экспирации
-        
-        Returns:
-            Список фьючерсов, отсортированных по дате экспирации
-        """
-        response = await self._services.instruments.futures(
-            instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
-        )
-
-        futures = []
-        now = datetime.now()
-
-        for fut in response.instruments:
-            # Фильтруем по базовому активу
-            if base_asset.lower() not in fut.basic_asset.lower():
-                continue
-                
-            expiration = fut.expiration_date.replace(tzinfo=None)
-            
-            # Пропускаем прошедшие экспирации
-            if expiration <= now:
-                continue
-            
-            # Опционально пропускаем текущий месяц
-            if skip_current_month:
-                if expiration.year == now.year and expiration.month == now.month:
-                    continue
-
-            futures.append({
-                "figi": fut.figi,
-                "ticker": fut.ticker,
-                "name": fut.name,
-                "lot": fut.lot,
-                "min_price_increment": float(quotation_to_decimal(fut.min_price_increment)),
-                "expiration": expiration,
-                "basic_asset": fut.basic_asset,
-                "uid": fut.uid,
-            })
-
-        # Сортируем по дате экспирации
-        futures.sort(key=lambda x: x["expiration"])
-        
-        logger.info("futures_loaded", base_asset=base_asset, count=len(futures))
-        return futures
-
-    async def get_next_futures(self, base_asset: str = "USD") -> Optional[Dict[str, Any]]:
-        """
-        Получает ближайший фьючерс (следующей экспирации).
-        
-        Args:
-            base_asset: Базовый актив
-        
-        Returns:
-            Данные фьючерса или None
-        """
-        futures = await self.get_futures_by_base_asset(base_asset, skip_current_month=True)
-        
-        if futures:
-            fut = futures[0]
-            logger.info(
-                "next_futures_found",
-                ticker=fut["ticker"],
-                expiration=fut["expiration"].strftime("%Y-%m-%d")
-            )
-            return fut
-        return None
 
     async def get_futures_by_ticker(self, ticker_prefix: str = "Si") -> Optional[Dict[str, Any]]:
         """
@@ -207,9 +125,7 @@ class TinkoffClient:
         
         if futures:
             fut = futures[0]
-            logger.info("futures_by_ticker_found", 
-                       ticker=fut["ticker"], 
-                       expiration=fut["expiration"].strftime("%Y-%m-%d"))
+            logger.info("futures_by_ticker_found", ticker=fut["ticker"], expiration=fut["expiration"].strftime("%Y-%m-%d"))
             return fut
         return None
 
@@ -224,22 +140,10 @@ class TinkoffClient:
         to_dt: datetime,
         interval: CandleInterval = CandleInterval.CANDLE_INTERVAL_HOUR
     ) -> List[Dict[str, Any]]:
-        """
-        Получает исторические свечи.
-        
-        Args:
-            figi: FIGI инструмента
-            from_dt: Начало периода (UTC)
-            to_dt: Конец периода (UTC)
-            interval: Интервал свечей
-        
-        Returns:
-            Список свечей
-        """
+        """Получает исторические свечи."""
         candles = []
         current_from = from_dt
 
-        # API ограничение: макс период зависит от интервала
         max_days = 365 if interval == CandleInterval.CANDLE_INTERVAL_HOUR else 30
 
         while current_from < to_dt:
@@ -254,7 +158,7 @@ class TinkoffClient:
                 )
 
                 for candle in response.candles:
-                    if candle.is_complete:  # Только завершённые свечи
+                    if candle.is_complete:
                         candles.append({
                             "time": candle.time,
                             "open": float(quotation_to_decimal(candle.open)),
@@ -264,7 +168,7 @@ class TinkoffClient:
                             "volume": candle.volume,
                         })
 
-                await asyncio.sleep(0.2)  # Rate limiting
+                await asyncio.sleep(0.2)
 
             except Exception as e:
                 logger.error("candles_error", figi=figi, error=str(e))
@@ -290,12 +194,7 @@ class TinkoffClient:
         return None
 
     async def get_orderbook(self, figi: str, depth: int = 5) -> Optional[Dict[str, Any]]:
-        """
-        Получает стакан заявок.
-        
-        Returns:
-            Dict с best_bid, best_ask, spread_pct, mid_price
-        """
+        """Получает стакан заявок."""
         try:
             response = await self._services.market_data.get_order_book(figi=figi, depth=depth)
 

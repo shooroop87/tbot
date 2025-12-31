@@ -1,119 +1,209 @@
 """
-Менеджер заявок.
+Менеджер заявок Tinkoff API.
 
-TODO: Реализовать в следующей итерации.
-
-Будет уметь:
-- Выставлять лимитные заявки
-- Выставлять рыночные заявки
-- Ставить стоп-заявки (невидимые в стакане)
-- Отменять заявки
-- Проверять статус заявок
+Поддерживает:
+- Отложенные заявки (тейк-профит на покупку) - невидимы в стакане
+- Отмена заявок
+- Получение списка активных заявок
 """
-from typing import Optional, Dict, Any
-from enum import Enum
+from typing import Optional, Dict, Any, List
+from decimal import Decimal
 
 import structlog
+from t_tech.invest import (
+    StopOrderDirection,
+    StopOrderType,
+    StopOrderExpirationType,
+)
+from t_tech.invest.utils import decimal_to_quotation, quotation_to_decimal
 
 logger = structlog.get_logger()
 
 
-class OrderType(Enum):
-    """Тип заявки."""
-    LIMIT = "limit"
-    MARKET = "market"
-    STOP_LOSS = "stop_loss"
-    TAKE_PROFIT = "take_profit"
-
-
-class OrderStatus(Enum):
-    """Статус заявки."""
-    PENDING = "pending"
-    FILLED = "filled"
-    PARTIALLY_FILLED = "partially_filled"
-    CANCELLED = "cancelled"
-    REJECTED = "rejected"
-
-
 class OrderManager:
     """
-    Менеджер заявок (заглушка).
+    Менеджер заявок.
     
-    Пример использования (будет реализовано):
-        >>> manager = OrderManager(client, config)
-        >>> order = await manager.place_limit_order(
-        ...     figi="BBG004730N88",
-        ...     direction="buy",
-        ...     quantity=10,
-        ...     price=280.50
-        ... )
-        >>> status = await manager.get_order_status(order.order_id)
+    Пример использования:
+        >>> async with TinkoffClient(config.tinkoff) as client:
+        ...     manager = OrderManager(client, config)
+        ...     result = await manager.place_take_profit_buy(
+        ...         figi="BBG004730N88",
+        ...         quantity=100,
+        ...         activation_price=29.61
+        ...     )
     """
 
     def __init__(self, tinkoff_client, config):
         self.client = tinkoff_client
         self.config = config
+        self.account_id = config.tinkoff.account_id
         self.logger = logger.bind(component="order_manager")
 
-    async def place_limit_order(
+    async def place_take_profit_buy(
         self,
         figi: str,
-        direction: str,
         quantity: int,
-        price: float,
-    ) -> Optional[Dict[str, Any]]:
+        activation_price: float,
+    ) -> Dict[str, Any]:
         """
-        Выставляет лимитную заявку.
+        Выставляет отложенную заявку Тейк-профит на ПОКУПКУ.
         
-        TODO: Реализовать.
+        Заявка невидима в стакане!
+        Сработает когда цена коснётся activation_price.
+        
+        Args:
+            figi: FIGI инструмента
+            quantity: Количество лотов
+            activation_price: Цена активации (BB Lower)
+        
+        Returns:
+            Dict с результатом:
+            - success: True/False
+            - stop_order_id: ID заявки (если успешно)
+            - error: текст ошибки (если неуспешно)
         """
-        self.logger.warning("place_limit_order: NOT IMPLEMENTED")
-        return None
+        # Проверка account_id
+        if not self.account_id:
+            self.logger.error("no_account_id")
+            return {
+                "success": False,
+                "error": "TINKOFF_ACCOUNT_ID не указан в .env"
+            }
+        
+        # Dry run режим
+        if self.config.dry_run:
+            self.logger.warning("dry_run_mode", 
+                              action="place_take_profit_buy",
+                              figi=figi,
+                              quantity=quantity,
+                              price=activation_price)
+            return {
+                "success": True,
+                "dry_run": True,
+                "stop_order_id": "DRY_RUN_ORDER_ID",
+                "message": f"Заявка НЕ выставлена (dry_run=True). Было бы: BUY {quantity} шт по {activation_price}"
+            }
+        
+        try:
+            services = self.client._services
+            
+            # Выставляем отложенную заявку тейк-профит на покупку
+            response = await services.stop_orders.post_stop_order(
+                figi=figi,
+                quantity=quantity,
+                stop_price=decimal_to_quotation(Decimal(str(activation_price))),
+                direction=StopOrderDirection.STOP_ORDER_DIRECTION_BUY,
+                account_id=self.account_id,
+                stop_order_type=StopOrderType.STOP_ORDER_TYPE_TAKE_PROFIT,
+                expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
+            )
+            
+            self.logger.info("take_profit_buy_placed",
+                           stop_order_id=response.stop_order_id,
+                           figi=figi,
+                           quantity=quantity,
+                           activation_price=activation_price)
+            
+            return {
+                "success": True,
+                "stop_order_id": response.stop_order_id,
+            }
+            
+        except Exception as e:
+            self.logger.exception("order_error", figi=figi)
+            return {
+                "success": False,
+                "error": str(e)
+            }
 
-    async def place_market_order(
-        self,
-        figi: str,
-        direction: str,
-        quantity: int,
-    ) -> Optional[Dict[str, Any]]:
+    async def cancel_stop_order(self, stop_order_id: str) -> Dict[str, Any]:
         """
-        Выставляет рыночную заявку.
+        Отменяет стоп-заявку.
         
-        TODO: Реализовать.
+        Args:
+            stop_order_id: ID стоп-заявки
+        
+        Returns:
+            Dict с результатом
         """
-        self.logger.warning("place_market_order: NOT IMPLEMENTED")
-        return None
+        if self.config.dry_run:
+            self.logger.warning("dry_run_mode", action="cancel_stop_order")
+            return {"success": True, "dry_run": True}
+            
+        try:
+            services = self.client._services
+            await services.stop_orders.cancel_stop_order(
+                account_id=self.account_id,
+                stop_order_id=stop_order_id
+            )
+            self.logger.info("stop_order_cancelled", stop_order_id=stop_order_id)
+            return {"success": True}
+        except Exception as e:
+            self.logger.error("cancel_stop_error", error=str(e))
+            return {"success": False, "error": str(e)}
 
-    async def place_stop_order(
-        self,
-        figi: str,
-        direction: str,
-        quantity: int,
-        stop_price: float,
-        order_type: str = "stop_loss",
-    ) -> Optional[Dict[str, Any]]:
+    async def get_stop_orders(self) -> List[Dict[str, Any]]:
         """
-        Выставляет стоп-заявку (невидимую в стакане).
+        Получает список активных стоп-заявок.
         
-        TODO: Реализовать.
+        Returns:
+            Список заявок с полями: stop_order_id, figi, direction, 
+            stop_price, quantity, status
         """
-        self.logger.warning("place_stop_order: NOT IMPLEMENTED")
-        return None
+        try:
+            services = self.client._services
+            response = await services.stop_orders.get_stop_orders(
+                account_id=self.account_id
+            )
+            
+            orders = []
+            for order in response.stop_orders:
+                orders.append({
+                    "stop_order_id": order.stop_order_id,
+                    "figi": order.figi,
+                    "direction": order.direction.name,
+                    "stop_price": float(quotation_to_decimal(order.stop_price)),
+                    "quantity": order.lots_requested,
+                    "status": order.status.name,
+                    "order_type": order.stop_order_type.name,
+                    "create_date": order.create_date,
+                })
+            
+            self.logger.debug("stop_orders_fetched", count=len(orders))
+            return orders
+            
+        except Exception as e:
+            self.logger.error("get_stop_orders_error", error=str(e))
+            return []
 
-    async def cancel_order(self, order_id: str) -> bool:
+    async def get_positions(self) -> List[Dict[str, Any]]:
         """
-        Отменяет заявку.
+        Получает текущие позиции в портфеле.
         
-        TODO: Реализовать.
+        Returns:
+            Список позиций
         """
-        self.logger.warning("cancel_order: NOT IMPLEMENTED")
-        return False
-
-    async def get_order_status(self, order_id: str) -> Optional[OrderStatus]:
-        """
-        Получает статус заявки.
-        
-        TODO: Реализовать.
-        """
-        self.logger.warning("get_order_status: NOT IMPLEMENTED")
-        return None
+        try:
+            services = self.client._services
+            response = await services.operations.get_portfolio(
+                account_id=self.account_id
+            )
+            
+            positions = []
+            for pos in response.positions:
+                if float(quotation_to_decimal(pos.quantity)) > 0:
+                    positions.append({
+                        "figi": pos.figi,
+                        "quantity": float(quotation_to_decimal(pos.quantity)),
+                        "average_price": float(quotation_to_decimal(pos.average_position_price)),
+                        "current_price": float(quotation_to_decimal(pos.current_price)),
+                        "expected_yield": float(quotation_to_decimal(pos.expected_yield)),
+                    })
+            
+            self.logger.debug("positions_fetched", count=len(positions))
+            return positions
+            
+        except Exception as e:
+            self.logger.error("get_positions_error", error=str(e))
+            return []
