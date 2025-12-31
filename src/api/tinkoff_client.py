@@ -36,20 +36,25 @@ class TinkoffClient:
     def __init__(self, config: TinkoffConfig):
         self.token = config.token
         self.account_id = config.account_id
-        self._client: Optional[AsyncClient] = None
+        self._async_client: Optional[AsyncClient] = None  # Для управления lifecycle
+        self._services = None  # Сервисы API
 
     async def __aenter__(self) -> "TinkoffClient":
         """Вход в async context."""
-        self._client = AsyncClient(
+        self._async_client = AsyncClient(
             token=self.token,
             target=INVEST_GRPC_API
         )
+        self._services = await self._async_client.__aenter__()
         logger.info("tinkoff_client_connected", target="prod")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Выход из async context."""
-        self._client = None
+        if self._async_client:
+            await self._async_client.__aexit__(exc_type, exc_val, exc_tb)
+        self._services = None
+        self._async_client = None
         logger.info("tinkoff_client_disconnected")
 
     # ═══════════════════════════════════════════════════════════
@@ -63,7 +68,7 @@ class TinkoffClient:
         Returns:
             Список словарей с данными акций
         """
-        response: SharesResponse = await self._client.instruments.shares(
+        response: SharesResponse = await self._services.instruments.shares(
             instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
         )
 
@@ -99,7 +104,7 @@ class TinkoffClient:
         Returns:
             Список фьючерсов, отсортированных по дате экспирации
         """
-        response = await self._client.instruments.futures(
+        response = await self._services.instruments.futures(
             instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
         )
 
@@ -194,7 +199,7 @@ class TinkoffClient:
             current_to = min(current_from + timedelta(days=max_days), to_dt)
 
             try:
-                response: GetCandlesResponse = await self._client.market_data.get_candles(
+                response: GetCandlesResponse = await self._services.market_data.get_candles(
                     figi=figi,
                     from_=current_from,
                     to=current_to,
@@ -230,7 +235,7 @@ class TinkoffClient:
     async def get_last_price(self, figi: str) -> Optional[float]:
         """Получает последнюю цену."""
         try:
-            response = await self._client.market_data.get_last_prices(figi=[figi])
+            response = await self._services.market_data.get_last_prices(figi=[figi])
             if response.last_prices:
                 return float(quotation_to_decimal(response.last_prices[0].price))
         except Exception as e:
@@ -245,7 +250,7 @@ class TinkoffClient:
             Dict с best_bid, best_ask, spread_pct, mid_price
         """
         try:
-            response = await self._client.market_data.get_order_book(figi=figi, depth=depth)
+            response = await self._services.market_data.get_order_book(figi=figi, depth=depth)
 
             if response.bids and response.asks:
                 best_bid = float(quotation_to_decimal(response.bids[0].price))
@@ -265,7 +270,7 @@ class TinkoffClient:
     async def get_trading_status(self, figi: str) -> Optional[str]:
         """Проверяет торговый статус инструмента."""
         try:
-            response = await self._client.market_data.get_trading_status(figi=figi)
+            response = await self._services.market_data.get_trading_status(figi=figi)
             return response.trading_status.name
         except Exception as e:
             logger.error("trading_status_error", figi=figi, error=str(e))
