@@ -1,11 +1,10 @@
 """
 Модуль исполнения заявок.
 
-TODO: Реализовать в следующей итерации:
 - OrderManager: выставление заявок
-- PositionTracker: отслеживание позиций
+- PositionWatcher: отслеживание заявок с автовыставлением SL/TP
 """
 from executor.order_manager import OrderManager
-from executor.position_tracker import PositionTracker
+from executor.position_watcher import PositionWatcher, OrderType, TrackedOrder
 
-__all__ = ["OrderManager", "PositionTracker"]
+__all__ = ["OrderManager", "PositionWatcher", "OrderType", "TrackedOrder"]

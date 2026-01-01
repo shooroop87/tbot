@@ -22,9 +22,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import load_config
 from api.telegram_notifier import TelegramNotifier
-from api.telegram_bot import TelegramBotAiogram, update_shares_cache
+from api.telegram_bot import (
+    TelegramBotAiogram, 
+    update_shares_cache, 
+    set_position_watcher,
+    set_scheduler,
+    set_watcher_task,
+)
 from db.repository import Repository
 from scheduler.jobs import DailyCalculationJob
+from executor.position_watcher import PositionWatcher
 
 structlog.configure(
     processors=[
@@ -59,6 +66,10 @@ async def main():
     
     # Telegram бот (aiogram)
     telegram_bot = TelegramBotAiogram(config)
+    
+    # Position Watcher для отслеживания заявок
+    position_watcher = PositionWatcher(config, notifier, poll_interval=5.0)
+    set_position_watcher(position_watcher)
 
     await notifier.send_startup(VERSION)
 
@@ -88,10 +99,16 @@ async def main():
     )
 
     scheduler.start()
+    set_scheduler(scheduler)
     logger.info("scheduler_started", daily_calc_time=f"{hour:02d}:{minute:02d} MSK")
 
     # Запускаем aiogram polling (блокирующий)
     logger.info("telegram_polling_started", message="Бот готов. Ctrl+C для остановки")
+    
+    # Запускаем Position Watcher в фоне
+    watcher_task = asyncio.create_task(position_watcher.start())
+    set_watcher_task(watcher_task)
+    logger.info("position_watcher_started", interval=5.0)
     
     try:
         # start_polling блокирует до остановки
@@ -100,6 +117,8 @@ async def main():
         logger.info("polling_cancelled")
     finally:
         logger.info("bot_stopping")
+        await position_watcher.stop()
+        watcher_task.cancel()
         await telegram_bot.stop()
         scheduler.shutdown(wait=False)
         await repo.close()

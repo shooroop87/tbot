@@ -2,13 +2,12 @@
 Отправка уведомлений в Telegram.
 
 Поддерживает:
-- Ежедневные отчёты с inline кнопками
+- Ежедневные отчёты
 - Сигналы на вход/выход
 - Результаты сделок
 - Алерты ошибок
 """
 import asyncio
-import json
 from typing import Optional, List, Dict, Any
 
 import aiohttp
@@ -20,7 +19,7 @@ logger = structlog.get_logger()
 
 
 class TelegramNotifier:
-    """Асинхронный клиент для отправки сообщений в Telegram с inline кнопками."""
+    """Асинхронный клиент для отправки сообщений в Telegram."""
 
     def __init__(self, config: TelegramConfig):
         self.bot_token = config.bot_token
@@ -32,7 +31,6 @@ class TelegramNotifier:
         text: str,
         parse_mode: str = "HTML",
         disable_notification: bool = False,
-        reply_markup: Optional[Dict] = None
     ) -> bool:
         """
         Отправляет сообщение в Telegram.
@@ -41,7 +39,6 @@ class TelegramNotifier:
             text: Текст сообщения (поддерживает HTML)
             parse_mode: Формат (HTML/Markdown)
             disable_notification: Без звука
-            reply_markup: Inline клавиатура (кнопки)
         
         Returns:
             True если успешно
@@ -57,9 +54,6 @@ class TelegramNotifier:
             "parse_mode": parse_mode,
             "disable_notification": disable_notification,
         }
-        
-        if reply_markup:
-            payload["reply_markup"] = json.dumps(reply_markup)
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -85,7 +79,7 @@ class TelegramNotifier:
             return f"{price:.3f}"
 
     async def send_daily_report(self, report: Dict[str, Any]) -> bool:
-        """Отправляет ежедневный отчёт с карточками акций и кнопками."""
+        """Отправляет ежедневный отчёт."""
         # Заголовок
         lines = [
             "📊 <b>Ежедневный расчёт</b>",
@@ -103,15 +97,17 @@ class TelegramNotifier:
             lines.append(f"📋 Ликвидные: {', '.join(liquid_shares[:15])}...")
         
         lines.append("")
+        lines.append("💡 Для заявки: <code>/buy TICKER</code>")
+        lines.append("")
         
         await self.send_message("\n".join(lines))
         
-        # Отправляем каждую акцию отдельным сообщением с кнопкой
+        # Отправляем каждую акцию отдельным сообщением
         top_shares = report.get("top_shares", [])
         if top_shares:
-            for share in top_shares:  # Показываем все акции
+            for share in top_shares:
                 await self._send_share_card(share)
-                await asyncio.sleep(0.3)  # Пауза между сообщениями
+                await asyncio.sleep(0.3)
         else:
             await self.send_message("<i>Нет акций с достаточными данными</i>")
         
@@ -131,11 +127,11 @@ class TelegramNotifier:
         return True
 
     async def _send_share_card(self, share: Dict[str, Any]) -> bool:
-        """Отправляет карточку акции с кнопкой заявки."""
+        """Отправляет карточку акции."""
         emoji = "🟢" if share.get("signal") == "BUY" else "⚪"
         
         lines = [
-            f"{emoji} <b>{share['ticker']}</b>",
+            f"{emoji} <b>{share['ticker']}</b> — <code>/buy {share['ticker']}</code>",
             f"   💵 Цена: {self._format_price(share['price'])} ₽",
             f"   📊 ATR: {self._format_price(share['atr'])} ({share['atr_pct']:.1f}%)",
             f"   📉 BB нижняя: {self._format_price(share['bb_lower'])} ₽",
@@ -151,27 +147,12 @@ class TelegramNotifier:
             f"   📏 До BB: {share.get('distance_to_bb_pct', 0):.1f}%",
         ]
         
-        text = "\n".join(lines)
-        
-        # Inline кнопка для выставления заявки
-        # callback_data: "buy:{ticker}" - ограничение Telegram 64 байта
-        callback_data = f"buy:{share['ticker']}"
-        
-        reply_markup = {
-            "inline_keyboard": [[
-                {
-                    "text": f"📝 Поставить заявку {share['ticker']}",
-                    "callback_data": callback_data
-                }
-            ]]
-        }
-        
-        return await self.send_message(text, reply_markup=reply_markup)
+        return await self.send_message("\n".join(lines))
 
     async def _send_futures_card(self, futures: Dict[str, Any]) -> bool:
-        """Отправляет карточку фьючерса с кнопкой."""
+        """Отправляет карточку фьючерса."""
         lines = [
-            f"<b>💵 Фьючерс {futures['ticker']}</b>",
+            f"<b>💵 Фьючерс {futures['ticker']}</b> — <code>/buy {futures['ticker']}</code>",
             f"   Цена: {futures['price']:,.0f}",
             f"   📊 ATR: {futures.get('atr', 0):,.0f} ({futures.get('atr_pct', 0):.1f}%)",
             f"   📉 BB нижняя: {futures['bb_lower']:,.0f}",
@@ -193,18 +174,7 @@ class TelegramNotifier:
         
         lines.append(f"   📅 Экспирация: {futures['expiration']}")
         
-        text = "\n".join(lines)
-        
-        reply_markup = {
-            "inline_keyboard": [[
-                {
-                    "text": f"📝 Поставить заявку {futures['ticker']}",
-                    "callback_data": f"buy:{futures['ticker']}"
-                }
-            ]]
-        }
-        
-        return await self.send_message(text, reply_markup=reply_markup)
+        return await self.send_message("\n".join(lines))
 
     async def send_signal(
         self,
@@ -234,8 +204,7 @@ class TelegramNotifier:
         if reason:
             lines.append(f"📝 {reason}")
 
-        text = "\n".join(lines)
-        return await self.send_message(text)
+        return await self.send_message("\n".join(lines))
 
     async def send_trade_result(
         self,
@@ -261,8 +230,7 @@ class TelegramNotifier:
         if reason:
             lines.append(f"📝 {reason}")
 
-        text = "\n".join(lines)
-        return await self.send_message(text)
+        return await self.send_message("\n".join(lines))
 
     async def send_error(self, error_msg: str, context: str = "") -> bool:
         """Отправляет сообщение об ошибке."""
@@ -271,12 +239,11 @@ class TelegramNotifier:
             lines.append(f"📍 {context}")
         lines.append(f"⚠️ {error_msg[:500]}")
 
-        text = "\n".join(lines)
-        return await self.send_message(text)
+        return await self.send_message("\n".join(lines))
 
     async def send_startup(self, version: str = "0.1.0") -> bool:
         """Отправляет сообщение о запуске бота."""
-        text = f"🤖 <b>Бот запущен</b>\n📌 Версия: {version}\n⏰ Ожидание расчёта в 06:30 МСК"
+        text = f"🤖 <b>Бот запущен</b>\n📌 Версия: {version}\n⏰ Ожидание расчёта в 06:30 МСК\n\n💡 Команды: /help"
         return await self.send_message(text)
 
     async def send_order_confirmation(
@@ -300,9 +267,11 @@ class TelegramNotifier:
 
     async def send_order_error(self, ticker: str, error: str) -> bool:
         """Отправляет сообщение об ошибке заявки."""
+        # Экранируем HTML-опасные символы
+        safe_error = error.replace("<", "&lt;").replace(">", "&gt;")[:500]
         lines = [
             f"❌ <b>Ошибка заявки</b>",
             f"📌 {ticker}",
-            f"⚠️ {error[:500]}",
+            f"⚠️ {safe_error}",
         ]
         return await self.send_message("\n".join(lines))

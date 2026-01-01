@@ -3,12 +3,15 @@
 
 Поддерживает:
 - Отложенные заявки (тейк-профит на покупку) - невидимы в стакане
+- Заявки до конца торговой сессии (не бессрочные!)
 - Отмена заявок
 - Получение списка активных заявок
 """
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from decimal import Decimal
 
+import pytz
 import structlog
 from t_tech.invest import (
     StopOrderDirection,
@@ -18,6 +21,25 @@ from t_tech.invest import (
 from t_tech.invest.utils import decimal_to_quotation, quotation_to_decimal
 
 logger = structlog.get_logger()
+MSK = pytz.timezone("Europe/Moscow")
+
+
+def get_session_end_time() -> datetime:
+    """
+    Возвращает время окончания торговой сессии (сегодня 23:50 МСК).
+    
+    Если уже после 19:00 — возвращает завтра.
+    """
+    now_msk = datetime.now(MSK)
+    
+    # Конец основной сессии — 23:50 МСК (с запасом)
+    session_end = now_msk.replace(hour=23, minute=50, second=0, microsecond=0)
+    
+    # Если уже после — завтра
+    if now_msk >= session_end:
+        session_end += timedelta(days=1)
+    
+    return session_end
 
 
 class OrderManager:
@@ -51,6 +73,7 @@ class OrderManager:
         
         Заявка НЕВИДИМА в стакане!
         Сработает когда цена ОПУСТИТСЯ до указанной цены.
+        Действует до конца торговой сессии.
         
         Args:
             figi: FIGI инструмента
@@ -101,6 +124,9 @@ class OrderManager:
             self.logger.info("calling_tinkoff_api", action="post_stop_order")
             services = self.client._services
             
+            # Время окончания заявки — конец сессии
+            expire_date = get_session_end_time()
+            
             # Выставляем отложенную заявку тейк-профит на покупку
             response = await services.stop_orders.post_stop_order(
                 figi=figi,
@@ -109,18 +135,21 @@ class OrderManager:
                 direction=StopOrderDirection.STOP_ORDER_DIRECTION_BUY,
                 account_id=self.account_id,
                 stop_order_type=StopOrderType.STOP_ORDER_TYPE_TAKE_PROFIT,
-                expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
+                expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_DATE,
+                expire_date=expire_date,
             )
             
             self.logger.info("take_profit_buy_placed",
                            order_id=response.stop_order_id,
                            figi=figi,
                            quantity=quantity,
-                           price=price)
+                           price=price,
+                           expires=expire_date.strftime("%Y-%m-%d %H:%M"))
             
             return {
                 "success": True,
                 "order_id": response.stop_order_id,
+                "expires": expire_date.isoformat(),
             }
             
         except Exception as e:
@@ -129,6 +158,92 @@ class OrderManager:
                 "success": False,
                 "error": str(e)
             }
+
+    async def place_stop_loss_sell(
+        self,
+        figi: str,
+        quantity: int,
+        price: float,
+    ) -> Dict[str, Any]:
+        """
+        Выставляет стоп-лосс на ПРОДАЖУ.
+        
+        Сработает когда цена ОПУСТИТСЯ до указанной.
+        Бессрочная заявка (пока не сработает или не отменим).
+        """
+        self.logger.info("place_stop_loss_sell_called",
+                        figi=figi, quantity=quantity, price=price)
+        
+        if not self.account_id:
+            return {"success": False, "error": "TINKOFF_ACCOUNT_ID не указан"}
+        
+        if self.config.dry_run:
+            return {"success": True, "dry_run": True, "order_id": "DRY_RUN_SL"}
+        
+        try:
+            services = self.client._services
+            
+            response = await services.stop_orders.post_stop_order(
+                figi=figi,
+                quantity=quantity,
+                stop_price=decimal_to_quotation(Decimal(str(price))),
+                direction=StopOrderDirection.STOP_ORDER_DIRECTION_SELL,
+                account_id=self.account_id,
+                stop_order_type=StopOrderType.STOP_ORDER_TYPE_STOP_LOSS,
+                expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
+            )
+            
+            self.logger.info("stop_loss_sell_placed",
+                           order_id=response.stop_order_id, price=price)
+            
+            return {"success": True, "order_id": response.stop_order_id}
+            
+        except Exception as e:
+            self.logger.exception("stop_loss_error", error=str(e))
+            return {"success": False, "error": str(e)}
+
+    async def place_take_profit_sell(
+        self,
+        figi: str,
+        quantity: int,
+        price: float,
+    ) -> Dict[str, Any]:
+        """
+        Выставляет тейк-профит на ПРОДАЖУ.
+        
+        Сработает когда цена ПОДНИМЕТСЯ до указанной.
+        Бессрочная заявка.
+        """
+        self.logger.info("place_take_profit_sell_called",
+                        figi=figi, quantity=quantity, price=price)
+        
+        if not self.account_id:
+            return {"success": False, "error": "TINKOFF_ACCOUNT_ID не указан"}
+        
+        if self.config.dry_run:
+            return {"success": True, "dry_run": True, "order_id": "DRY_RUN_TP"}
+        
+        try:
+            services = self.client._services
+            
+            response = await services.stop_orders.post_stop_order(
+                figi=figi,
+                quantity=quantity,
+                stop_price=decimal_to_quotation(Decimal(str(price))),
+                direction=StopOrderDirection.STOP_ORDER_DIRECTION_SELL,
+                account_id=self.account_id,
+                stop_order_type=StopOrderType.STOP_ORDER_TYPE_TAKE_PROFIT,
+                expiration_type=StopOrderExpirationType.STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL,
+            )
+            
+            self.logger.info("take_profit_sell_placed",
+                           order_id=response.stop_order_id, price=price)
+            
+            return {"success": True, "order_id": response.stop_order_id}
+            
+        except Exception as e:
+            self.logger.exception("take_profit_error", error=str(e))
+            return {"success": False, "error": str(e)}
 
     async def cancel_stop_order(self, order_id: str) -> Dict[str, Any]:
         """Отменяет стоп-заявку."""
