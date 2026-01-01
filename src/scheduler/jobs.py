@@ -44,10 +44,10 @@ class DailyCalculationJob:
         
         now_msk = datetime.now(MSK)
         
-        if now_msk.weekday() >= 5:
-            logger.info("skipping_weekend")
-            await self.notifier.send_message("📅 Выходной день, расчёт пропущен")
-            return
+        # Расчёт запускается в любой день, данные фильтруются по пн-пт автоматически
+        is_weekend = now_msk.weekday() >= 5
+        if is_weekend:
+            logger.info("running_on_weekend", message="Данные берутся за последние рабочие дни")
         
         report = {
             "date": now_msk.strftime("%Y-%m-%d %H:%M МСК"),
@@ -58,6 +58,7 @@ class DailyCalculationJob:
             "liquid_shares": [],
             "futures_si": None,
             "liquid_count": 0,
+            "is_weekend": is_weekend,
         }
 
         try:
@@ -199,7 +200,7 @@ class DailyCalculationJob:
             logger.warning("no_candles", ticker=ticker)
             return None
         
-        # Агрегация в дневные (10-19 МСК)
+        # Агрегация в дневные (10-19 МСК, пн-пт)
         daily_df = aggregate_hourly_to_daily(candles)
         if daily_df.empty or len(daily_df) < 20:
             logger.warning("insufficient_daily", ticker=ticker, days=len(daily_df))
@@ -307,6 +308,7 @@ class DailyCalculationJob:
         if not candles:
             return None
         
+        # Агрегация в дневные (10-19 МСК, пн-пт)
         daily_df = aggregate_hourly_to_daily(candles)
         if daily_df.empty or len(daily_df) < 20:
             return None

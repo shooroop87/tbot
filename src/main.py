@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import load_config
 from api.telegram_notifier import TelegramNotifier
-from api.telegram_bot import TelegramBot
+from api.telegram_bot import TelegramBotAiogram, update_shares_cache
 from db.repository import Repository
 from scheduler.jobs import DailyCalculationJob
 
@@ -36,7 +36,7 @@ structlog.configure(
 logger = structlog.get_logger()
 
 MSK = pytz.timezone("Europe/Moscow")
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 async def main():
@@ -57,15 +57,17 @@ async def main():
     notifier = TelegramNotifier(config.telegram)
     daily_job = DailyCalculationJob(config, repo, notifier)
     
-    # Telegram бот для обработки кнопок
-    telegram_bot = TelegramBot(config)
+    # Telegram бот (aiogram)
+    telegram_bot = TelegramBotAiogram(config)
 
     await notifier.send_startup(VERSION)
 
+    # Режим --now: немедленный расчёт
     if "--now" in sys.argv:
         logger.info("running_immediate_calculation")
         await daily_job.run()
         
+        # Режим --once: только расчёт, без polling
         if "--once" in sys.argv:
             logger.info("single_run_complete")
             await repo.close()
@@ -88,19 +90,17 @@ async def main():
     scheduler.start()
     logger.info("scheduler_started", daily_calc_time=f"{hour:02d}:{minute:02d} MSK")
 
-    # Запускаем polling для кнопок
-    polling_task = asyncio.create_task(telegram_bot.start_polling())
-    logger.info("telegram_polling_started", message="Кнопки активны")
-
+    # Запускаем aiogram polling (блокирующий)
+    logger.info("telegram_polling_started", message="Бот готов. Ctrl+C для остановки")
+    
     try:
-        logger.info("bot_running", message="Press Ctrl+C to stop")
-        while True:
-            await asyncio.sleep(60)
-    except KeyboardInterrupt:
-        logger.info("bot_stopping")
+        # start_polling блокирует до остановки
+        await telegram_bot.start()
+    except asyncio.CancelledError:
+        logger.info("polling_cancelled")
     finally:
+        logger.info("bot_stopping")
         await telegram_bot.stop()
-        polling_task.cancel()
         scheduler.shutdown(wait=False)
         await repo.close()
         logger.info("bot_stopped")
@@ -110,4 +110,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        logger.info("keyboard_interrupt")
