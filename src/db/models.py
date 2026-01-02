@@ -4,7 +4,7 @@
 Таблицы:
 - instruments: справочник инструментов (акции, фьючерсы)
 - candles_daily: дневные свечи
-- indicators_daily: ежедневные индикаторы (ATR, BB, etc)
+- indicators_daily: ежедневные индикаторы (ATR, BB, EMA, etc)
 - signals: торговые сигналы
 - trades: завершённые сделки
 """
@@ -86,7 +86,6 @@ class IndicatorDaily(Base):
     Ежедневные индикаторы по инструменту.
     
     Хранит предрассчитанные значения индикаторов.
-    Можно добавлять новые столбцы или использовать JSON поле extra.
     """
     __tablename__ = "indicators_daily"
 
@@ -110,6 +109,16 @@ class IndicatorDaily(Base):
     # Позиция цены относительно BB
     bb_position_pct = Column(Float)  # 0 = на lower, 100 = на upper
     distance_to_bb_lower_pct = Column(Float)  # расстояние до нижней в %
+    
+    # === EMA (13/26) - система двух скользящих ===
+    ema_13 = Column(Float)  # Быстрая EMA
+    ema_26 = Column(Float)  # Медленная EMA
+    ema_trend = Column(String(10))  # UP / DOWN / WEAK_UP / FLAT
+    ema_diff_pct = Column(Float)  # (ema_13 - ema_26) / ema_26 * 100
+    ema_13_slope = Column(Float)  # Наклон EMA13 за 3 дня в %
+    ema_26_slope = Column(Float)  # Наклон EMA26 за 3 дня в %
+    distance_to_ema_13_pct = Column(Float)  # Расстояние цены от EMA13 в %
+    distance_to_ema_26_pct = Column(Float)  # Расстояние цены от EMA26 в %
 
     # Ликвидность за день
     volume_rub = Column(Float)
@@ -151,7 +160,7 @@ class Signal(Base):
     max_loss = Column(Float)
     
     # Причина и стратегия
-    strategy = Column(String(50))  # bollinger_bounce
+    strategy = Column(String(50))  # bollinger_bounce, ema_pullback
     reason = Column(Text)
     confidence = Column(Float)
 
