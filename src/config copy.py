@@ -8,7 +8,7 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -28,8 +28,6 @@ class TelegramConfig:
     """Настройки Telegram бота."""
     bot_token: str
     chat_id: str
-    # Список авторизованных user_id (могут управлять ботом)
-    authorized_users: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -94,10 +92,6 @@ class LiquidityConfig:
     max_spread_pct: float = 0.15
     lookback_days: int = 20
     max_instruments: int = 30
-    # Расширенный lookback для праздников (90 календарных дней)
-    extended_lookback_days: int = 90
-    # Минимум торговых дней для расчёта
-    min_trading_days: int = 26
 
 
 @dataclass
@@ -131,23 +125,6 @@ class Config:
     kill_switch: bool = False
 
 
-def _parse_authorized_users(env_value: str) -> List[int]:
-    """
-    Парсит список авторизованных user_id из строки.
-    
-    Формат: "123456789,987654321" или "123456789"
-    """
-    if not env_value:
-        return []
-    
-    users = []
-    for part in env_value.split(","):
-        part = part.strip()
-        if part.isdigit():
-            users.append(int(part))
-    return users
-
-
 def load_config(config_path: str = "config.yaml") -> Config:
     """
     Загружает конфигурацию из YAML и env-переменных.
@@ -176,17 +153,6 @@ def load_config(config_path: str = "config.yaml") -> Config:
     if missing:
         raise ValueError(f"Missing required env vars: {', '.join(missing)}")
 
-    # Парсим авторизованных пользователей
-    authorized_users = _parse_authorized_users(
-        os.getenv("TELEGRAM_AUTHORIZED_USERS", "")
-    )
-    
-    # Если не указаны — используем chat_id как единственного авторизованного
-    if not authorized_users:
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-        if chat_id.lstrip("-").isdigit():
-            authorized_users = [int(chat_id)]
-
     return Config(
         tinkoff=TinkoffConfig(
             token=os.getenv("TINKOFF_TOKEN", ""),
@@ -195,7 +161,6 @@ def load_config(config_path: str = "config.yaml") -> Config:
         telegram=TelegramConfig(
             bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
-            authorized_users=authorized_users,
         ),
         database=DatabaseConfig(
             host=os.getenv("POSTGRES_HOST", "localhost"),
@@ -232,8 +197,6 @@ def load_config(config_path: str = "config.yaml") -> Config:
             max_spread_pct=cfg.get("liquidity", {}).get("max_spread_pct", 0.15),
             lookback_days=cfg.get("liquidity", {}).get("lookback_days", 20),
             max_instruments=cfg.get("liquidity", {}).get("max_instruments", 30),
-            extended_lookback_days=cfg.get("liquidity", {}).get("extended_lookback_days", 90),
-            min_trading_days=cfg.get("liquidity", {}).get("min_trading_days", 26),
         ),
         trading_hours=TradingHoursConfig(
             start=cfg.get("trading_hours", {}).get("start", "10:00"),

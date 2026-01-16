@@ -2,6 +2,11 @@
 Планируемые задачи.
 
 DailyCalculationJob: ежедневный расчёт индикаторов в 06:30 МСК
+
+Диагностика:
+- Логирует причины отсутствия ликвидных акций
+- Расширенный lookback для праздников
+- Информативные сообщения в Telegram
 """
 import asyncio
 from datetime import datetime, timedelta, date
@@ -26,7 +31,7 @@ ORDER_AMOUNT_RUB = 100_000
 
 
 class DailyCalculationJob:
-    """Ежедневный расчёт индикаторов с EMA(13/26)."""
+    """Ежедневный расчёт индикаторов с диагностикой."""
 
     def __init__(
         self,
@@ -37,10 +42,40 @@ class DailyCalculationJob:
         self.config = config
         self.repo = repository
         self.notifier = notifier
+        
+        # Статистика для диагностики
+        self._diagnostics = {
+            "total_shares": 0,
+            "volume_passed": 0,
+            "volume_failed": 0,
+            "spread_passed": 0,
+            "spread_failed": 0,
+            "indicators_ok": 0,
+            "indicators_failed": 0,
+            "insufficient_days": 0,
+            "no_candles": 0,
+            "errors": [],
+        }
+
+    def _reset_diagnostics(self):
+        """Сбрасывает статистику."""
+        self._diagnostics = {
+            "total_shares": 0,
+            "volume_passed": 0,
+            "volume_failed": 0,
+            "spread_passed": 0,
+            "spread_failed": 0,
+            "indicators_ok": 0,
+            "indicators_failed": 0,
+            "insufficient_days": 0,
+            "no_candles": 0,
+            "errors": [],
+        }
 
     async def run(self):
         """Запускает ежедневный расчёт."""
         logger.info("daily_calculation_started")
+        self._reset_diagnostics()
         
         now_msk = datetime.now(MSK)
         calc_date = now_msk.date()
@@ -59,6 +94,7 @@ class DailyCalculationJob:
             "futures_si": None,
             "liquid_count": 0,
             "is_weekend": is_weekend,
+            "diagnostics": None,  # Добавим диагностику
         }
 
         try:
@@ -73,6 +109,9 @@ class DailyCalculationJob:
                     result = await self._analyze_share(client, share, calc_date)
                     if result:
                         report["top_shares"].append(result)
+                        self._diagnostics["indicators_ok"] += 1
+                    else:
+                        self._diagnostics["indicators_failed"] += 1
                     await asyncio.sleep(0.3)
                 
                 # 3. Фьючерс Si
@@ -81,8 +120,8 @@ class DailyCalculationJob:
                 # Сортировка: сначала UP тренд, потом по distance_to_ema
                 report["top_shares"].sort(
                     key=lambda x: (
-                        x.get("ema_trend") != "UP",  # UP первые
-                        abs(x.get("distance_to_ema_13_pct", 100))  # Ближе к EMA
+                        x.get("ema_trend") != "UP",
+                        abs(x.get("distance_to_ema_13_pct", 100))
                     )
                 )
                 
@@ -91,21 +130,93 @@ class DailyCalculationJob:
                 if report["futures_si"]:
                     all_for_cache.append(report["futures_si"])
                 update_shares_cache(all_for_cache)
+                
+                # 5. Добавляем диагностику в отчёт
+                report["diagnostics"] = self._diagnostics.copy()
 
         except Exception as e:
             logger.exception("daily_calculation_error")
+            self._diagnostics["errors"].append(str(e))
             await self.notifier.send_error(str(e), "Ежедневный расчёт")
             return
 
-        logger.info("sending_report", shares=len(report["top_shares"]))
-        await self.notifier.send_daily_report(report)
+        logger.info("sending_report", 
+                   shares=len(report["top_shares"]),
+                   diagnostics=self._diagnostics)
+        
+        await self._send_report_with_diagnostics(report)
         logger.info("daily_calculation_complete")
 
+    async def _send_report_with_diagnostics(self, report: Dict[str, Any]):
+        """Отправляет отчёт с диагностикой."""
+        diag = report.get("diagnostics", {})
+        
+        # Основной отчёт
+        await self.notifier.send_daily_report(report)
+        
+        # Если 0 акций — отправляем диагностику
+        if report["liquid_count"] == 0:
+            reasons = []
+            
+            if diag.get("total_shares", 0) == 0:
+                reasons.append("• API не вернул акции")
+            
+            if diag.get("volume_failed", 0) > 0:
+                reasons.append(
+                    f"• Объём ниже порога: {diag['volume_failed']} акций\n"
+                    f"  (порог: {self.config.liquidity.min_avg_volume_rub/1_000_000:.0f} млн ₽/день)"
+                )
+            
+            if diag.get("spread_failed", 0) > 0:
+                reasons.append(
+                    f"• Спред выше порога: {diag['spread_failed']} акций\n"
+                    f"  (порог: {self.config.liquidity.max_spread_pct}%)"
+                )
+            
+            if diag.get("insufficient_days", 0) > 0:
+                reasons.append(
+                    f"• Недостаточно торговых дней: {diag['insufficient_days']} акций\n"
+                    f"  (нужно минимум {self.config.liquidity.min_trading_days} дней для EMA26)"
+                )
+            
+            if diag.get("no_candles", 0) > 0:
+                reasons.append(f"• Нет свечей: {diag['no_candles']} акций")
+            
+            if diag.get("errors"):
+                reasons.append(f"• Ошибки: {len(diag['errors'])}")
+            
+            if not reasons:
+                reasons.append("• Причина не определена")
+            
+            # Совет
+            advice = []
+            if diag.get("insufficient_days", 0) > 0:
+                advice.append(
+                    "💡 Возможно, это связано с праздниками (мало торговых дней).\n"
+                    "Бот использует расширенный lookback (90 дней), но после длинных "
+                    "праздников может потребоваться несколько рабочих дней для накопления данных."
+                )
+            
+            advice_text = "\n\n".join(advice) if advice else ""
+            
+            await self.notifier.send_message(
+                f"🔍 <b>Диагностика: почему 0 ликвидных акций</b>\n\n"
+                f"📊 <b>Статистика:</b>\n"
+                f"• Всего акций в API: {diag.get('total_shares', 0)}\n"
+                f"• Прошли фильтр объёма: {diag.get('volume_passed', 0)}\n"
+                f"• Прошли фильтр спреда: {diag.get('spread_passed', 0)}\n"
+                f"• Индикаторы рассчитаны: {diag.get('indicators_ok', 0)}\n\n"
+                f"❌ <b>Причины отсева:</b>\n"
+                f"{chr(10).join(reasons)}\n\n"
+                f"{advice_text}"
+            )
+
     async def _get_liquid_shares(self, client: TinkoffClient) -> List[Dict[str, Any]]:
-        """Получает ликвидные акции."""
+        """Получает ликвидные акции с диагностикой."""
         logger.info("fetching_liquid_shares")
         
         all_shares = await client.get_shares()
+        self._diagnostics["total_shares"] = len(all_shares)
         logger.info("total_shares", count=len(all_shares))
         
         shares_with_volume = []
@@ -115,16 +226,26 @@ class DailyCalculationJob:
             
             try:
                 volume_data = await self._calculate_avg_volume(client, share["figi"])
-                if volume_data and volume_data["avg_volume_rub"] >= self.config.liquidity.min_avg_volume_rub:
-                    shares_with_volume.append({**share, **volume_data})
+                if volume_data:
+                    if volume_data["avg_volume_rub"] >= self.config.liquidity.min_avg_volume_rub:
+                        shares_with_volume.append({**share, **volume_data})
+                        self._diagnostics["volume_passed"] += 1
+                    else:
+                        self._diagnostics["volume_failed"] += 1
+                else:
+                    self._diagnostics["no_candles"] += 1
             except Exception as e:
                 logger.error("volume_check_error", ticker=share["ticker"], error=str(e))
+                self._diagnostics["errors"].append(f"{share['ticker']}: {str(e)[:50]}")
             
             await asyncio.sleep(0.15)
         
         shares_with_volume.sort(key=lambda x: x["avg_volume_rub"], reverse=True)
-        logger.info("volume_check_complete", passed=len(shares_with_volume))
+        logger.info("volume_check_complete", 
+                   passed=self._diagnostics["volume_passed"],
+                   failed=self._diagnostics["volume_failed"])
         
+        # Проверка спреда
         liquid_shares = []
         check_count = min(len(shares_with_volume), self.config.liquidity.max_instruments * 2)
         
@@ -132,8 +253,10 @@ class DailyCalculationJob:
             try:
                 orderbook = await client.get_orderbook(share["figi"])
                 if not orderbook:
+                    self._diagnostics["spread_failed"] += 1
                     continue
                 if orderbook["spread_pct"] > self.config.liquidity.max_spread_pct:
+                    self._diagnostics["spread_failed"] += 1
                     continue
                 
                 liquid_shares.append({
@@ -141,12 +264,14 @@ class DailyCalculationJob:
                     "spread_pct": orderbook["spread_pct"],
                     "last_price": orderbook["mid_price"],
                 })
+                self._diagnostics["spread_passed"] += 1
                 
                 if len(liquid_shares) >= self.config.liquidity.max_instruments:
                     break
                     
             except Exception as e:
                 logger.error("spread_check_error", ticker=share["ticker"], error=str(e))
+                self._diagnostics["spread_failed"] += 1
             
             await asyncio.sleep(0.15)
         
@@ -154,20 +279,32 @@ class DailyCalculationJob:
         return liquid_shares
 
     async def _calculate_avg_volume(self, client: TinkoffClient, figi: str) -> Optional[Dict]:
-        """Рассчитывает средний дневной объём."""
-        days = self.config.liquidity.lookback_days
+        """
+        Рассчитывает средний дневной объём.
+        
+        Использует расширенный lookback (90 дней) для праздников.
+        """
+        # Используем расширенный lookback для учёта праздников
+        extended_days = self.config.liquidity.extended_lookback_days
         
         candles = await client.get_candles(
             figi=figi,
-            from_dt=datetime.utcnow() - timedelta(days=days + 5),
+            from_dt=datetime.utcnow() - timedelta(days=extended_days),
             to_dt=datetime.utcnow(),
             interval=CandleInterval.CANDLE_INTERVAL_DAY
         )
         
-        if not candles or len(candles) < days // 2:
+        if not candles:
             return None
         
-        volumes_rub = [c["volume"] * c["close"] for c in candles[-days:]]
+        # Берём последние N дней
+        lookback = self.config.liquidity.lookback_days
+        recent = candles[-lookback:] if len(candles) >= lookback else candles
+        
+        if len(recent) < lookback // 2:
+            return None
+        
+        volumes_rub = [c["volume"] * c["close"] for c in recent]
         if not volumes_rub:
             return None
         
@@ -204,27 +341,42 @@ class DailyCalculationJob:
         
         logger.info("analyzing_share", ticker=ticker)
         
-        # ЧАСОВЫЕ свечи за 40 дней (нужно 26 для EMA26)
+        # Расширенный lookback для праздников
+        extended_days = self.config.liquidity.extended_lookback_days
+        min_trading_days = self.config.liquidity.min_trading_days
+        
         candles = await client.get_candles(
             figi=figi,
-            from_dt=datetime.utcnow() - timedelta(days=40),
+            from_dt=datetime.utcnow() - timedelta(days=extended_days),
             to_dt=datetime.utcnow(),
             interval=CandleInterval.CANDLE_INTERVAL_HOUR
         )
         
         if not candles:
             logger.warning("no_candles", ticker=ticker)
+            self._diagnostics["no_candles"] += 1
             return None
         
         # Агрегация в дневные (10-19 МСК, пн-пт)
         daily_df = aggregate_hourly_to_daily(candles)
-        if daily_df.empty or len(daily_df) < 26:
-            logger.warning("insufficient_daily", ticker=ticker, days=len(daily_df))
+        
+        if daily_df.empty:
+            logger.warning("empty_daily_df", ticker=ticker)
+            self._diagnostics["no_candles"] += 1
+            return None
+        
+        if len(daily_df) < min_trading_days:
+            logger.warning("insufficient_daily", 
+                          ticker=ticker, 
+                          days=len(daily_df),
+                          required=min_trading_days)
+            self._diagnostics["insufficient_days"] += 1
             return None
         
         # Индикаторы (включая EMA 13/26)
         indicators = calculate_indicators(daily_df)
         if not indicators:
+            self._diagnostics["indicators_failed"] += 1
             return None
         
         current_price = share.get("last_price") or indicators["close"]
@@ -303,6 +455,7 @@ class DailyCalculationJob:
                    ema_13=round(ema_13, 2),
                    ema_26=round(ema_26, 2),
                    ema_trend=ema_trend,
+                   trading_days=len(daily_df),
                    signal=signal)
         
         return {
@@ -337,6 +490,8 @@ class DailyCalculationJob:
             "potential_profit": round(potential_profit, 0),
             "distance_to_bb_pct": round(distance_to_bb_pct, 2),
             "signal": signal,
+            # Диагностика
+            "trading_days": len(daily_df),
         }
 
     async def _analyze_futures_si(
@@ -351,9 +506,12 @@ class DailyCalculationJob:
         if not si_future:
             return None
         
+        extended_days = self.config.liquidity.extended_lookback_days
+        min_trading_days = self.config.liquidity.min_trading_days
+        
         candles = await client.get_candles(
             figi=si_future["figi"],
-            from_dt=datetime.utcnow() - timedelta(days=40),
+            from_dt=datetime.utcnow() - timedelta(days=extended_days),
             to_dt=datetime.utcnow(),
             interval=CandleInterval.CANDLE_INTERVAL_HOUR
         )
@@ -362,7 +520,10 @@ class DailyCalculationJob:
             return None
         
         daily_df = aggregate_hourly_to_daily(candles)
-        if daily_df.empty or len(daily_df) < 26:
+        if daily_df.empty or len(daily_df) < min_trading_days:
+            logger.warning("si_insufficient_days", 
+                          days=len(daily_df) if not daily_df.empty else 0,
+                          required=min_trading_days)
             return None
         
         indicators = calculate_indicators(daily_df)
@@ -432,7 +593,8 @@ class DailyCalculationJob:
         potential_profit = position_size * take_profit_offset
         
         logger.info("si_analyzed", ticker=si_future["ticker"], price=price,
-                   ema_13=round(ema_13, 0), ema_26=round(ema_26, 0), ema_trend=ema_trend)
+                   ema_13=round(ema_13, 0), ema_26=round(ema_26, 0), ema_trend=ema_trend,
+                   trading_days=len(daily_df))
         
         return {
             "ticker": si_future["ticker"],
@@ -463,4 +625,6 @@ class DailyCalculationJob:
             "potential_loss": round(potential_loss, 0),
             "potential_profit": round(potential_profit, 0),
             "expiration": si_future["expiration"].strftime("%Y-%m-%d"),
+            # Диагностика
+            "trading_days": len(daily_df),
         }
