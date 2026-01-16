@@ -3,8 +3,10 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Установка системных зависимостей
+# Добавляем git для установки из GitLab
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Копируем requirements и устанавливаем зависимости

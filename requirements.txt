@@ -1,5 +1,5 @@
 # T-Invest API (новый пакет, бывший tinkoff-investments)
-t-tech-investments
+t-tech-investments @ git+https://opensource.tbank.ru/invest/invest-python.git
 
 # Database
 sqlalchemy==2.0.23
