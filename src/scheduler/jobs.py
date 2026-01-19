@@ -251,18 +251,14 @@ class DailyCalculationJob:
         
         for share in shares_with_volume[:check_count]:
             try:
-                orderbook = await client.get_orderbook(share["figi"])
-                if not orderbook:
-                    self._diagnostics["spread_failed"] += 1
-                    continue
-                if orderbook["spread_pct"] > self.config.liquidity.max_spread_pct:
-                    self._diagnostics["spread_failed"] += 1
+                # Получаем цену (спред не проверяем)
+                last_price = await client.get_last_price(share["figi"])
+                if not last_price:
                     continue
                 
                 liquid_shares.append({
                     **share,
-                    "spread_pct": orderbook["spread_pct"],
-                    "last_price": orderbook["mid_price"],
+                    "last_price": last_price,
                 })
                 self._diagnostics["spread_passed"] += 1
                 
