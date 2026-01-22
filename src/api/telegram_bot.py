@@ -422,25 +422,31 @@ class TelegramBotAiogram:
                 settings = await _repository.get_bot_settings()
                 stats = await _repository.get_order_stats()
                 
+                sl_count = settings.total_sl_triggered or 0
+                tp_count = settings.total_tp_triggered or 0
+                orders_count = settings.total_orders_placed or 0
+                total_pnl = stats.get('total_pnl_rub') or 0
+                
                 win_rate = 0
-                total_closed = settings.total_sl_triggered + settings.total_tp_triggered
+                total_closed = sl_count + tp_count
                 if total_closed > 0:
-                    win_rate = settings.total_tp_triggered / total_closed * 100
+                    win_rate = tp_count / total_closed * 100
                 
                 await message.answer(
                     f"📊 <b>Статистика</b>\n\n"
                     f"<b>Заявки:</b>\n"
-                    f"• Всего выставлено: {settings.total_orders_placed}\n"
-                    f"• SL сработало: {settings.total_sl_triggered}\n"
-                    f"• TP сработало: {settings.total_tp_triggered}\n"
+                    f"• Всего выставлено: {orders_count}\n"
+                    f"• SL сработало: {sl_count}\n"
+                    f"• TP сработало: {tp_count}\n"
                     f"• Win Rate: {win_rate:.1f}%\n\n"
                     f"<b>Результат:</b>\n"
-                    f"• Общий PnL: {stats['total_pnl_rub']:+,.0f} ₽",
+                    f"• Общий PnL: {total_pnl:+,.0f} ₽",
                     parse_mode="HTML"
                 )
                 
             except Exception as e:
                 await message.answer(f"❌ Ошибка: {escape_html(str(e))}", parse_mode="HTML")
+
 
         @self.dp.message(Command("buy"))
         async def cmd_buy(message: Message):
