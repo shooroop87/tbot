@@ -1,14 +1,10 @@
 """
-Загрузка и валидация конфигурации
-
-Источники:
-- config.yaml: параметры стратегий, риска, расписания
-- .env: секреты (токены, пароли)
+Загрузка и валидация конфигурации.
 """
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, List
+from typing import List
 
 import yaml
 from dotenv import load_dotenv
@@ -18,23 +14,19 @@ load_dotenv()
 
 @dataclass
 class TinkoffConfig:
-    """Настройки Tinkoff API."""
     token: str
     account_id: str = ""
 
 
 @dataclass
 class TelegramConfig:
-    """Настройки Telegram бота."""
     bot_token: str
     chat_id: str
-    # Список авторизованных user_id (могут управлять ботом)
     authorized_users: List[int] = field(default_factory=list)
 
 
 @dataclass
 class DatabaseConfig:
-    """Настройки PostgreSQL."""
     host: str
     port: int
     name: str
@@ -43,145 +35,78 @@ class DatabaseConfig:
 
     @property
     def url(self) -> str:
-        """Строка подключения для SQLAlchemy."""
         return f"postgresql+asyncpg://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
-
-    @property
-    def sync_url(self) -> str:
-        """Синхронная строка подключения."""
-        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
 
 
 @dataclass
 class TradingConfig:
-    """Настройки торговли."""
     deposit_rub: float
     risk_per_trade_pct: float
     max_position_pct: float
 
 
 @dataclass
-class ATRConfig:
-    """Настройки ATR."""
-    period: int = 14
-
-
-@dataclass
 class BollingerConfig:
-    """Настройки Bollinger Bands."""
     period: int = 20
     std_multiplier: float = 2.0
     entry_threshold_pct: float = 1.0
 
 
 @dataclass
-class RiskConfig:
-    """Настройки риск-менеджмента."""
-    stop_loss_atr: float = 0.3
-    take_profit_atr: float = 0.5
-    max_position_pct: float = 0.25
-    max_margin_pct: float = 0.30
-    max_open_positions: int = 3
-    max_daily_loss_pct: float = 0.03
-    cooldown_after_stop_min: int = 30
-
-
-@dataclass
 class LiquidityConfig:
-    """Настройки фильтра ликвидности."""
     min_avg_volume_rub: float = 50_000_000
-    min_trades_per_day: int = 1000
     max_spread_pct: float = 0.15
     lookback_days: int = 20
     max_instruments: int = 30
-    # Расширенный lookback для праздников (90 календарных дней)
     extended_lookback_days: int = 90
-    # Минимум торговых дней для расчёта
     min_trading_days: int = 26
 
 
 @dataclass
-class TradingHoursConfig:
-    """Торговые часы."""
-    start: str = "10:00"
-    end: str = "19:00"
-    timezone: str = "Europe/Moscow"
-
-
-@dataclass
 class ScheduleConfig:
-    """Расписание задач."""
     daily_calc_time: str = "06:30"
 
 
 @dataclass
 class Config:
-    """Главный конфиг приложения."""
     tinkoff: TinkoffConfig
     telegram: TelegramConfig
     database: DatabaseConfig
     trading: TradingConfig
-    atr: ATRConfig
     bollinger: BollingerConfig
-    risk: RiskConfig
     liquidity: LiquidityConfig
-    trading_hours: TradingHoursConfig
     schedule: ScheduleConfig
     dry_run: bool = True
-    kill_switch: bool = False
 
 
 def _parse_authorized_users(env_value: str) -> List[int]:
-    """
-    Парсит список авторизованных user_id из строки.
-    
-    Формат: "123456789,987654321" или "123456789"
-    """
+    """Парсит список user_id из строки."""
     if not env_value:
         return []
-    
     users = []
     for part in env_value.split(","):
         part = part.strip()
-        if part.isdigit():
+        if part.lstrip("-").isdigit():
             users.append(int(part))
     return users
 
 
 def load_config(config_path: str = "config.yaml") -> Config:
-    """
-    Загружает конфигурацию из YAML и env-переменных.
-    
-    Args:
-        config_path: Путь к config.yaml
-    
-    Returns:
-        Config объект
-    
-    Raises:
-        ValueError: Если не хватает обязательных переменных
-        FileNotFoundError: Если config.yaml не найден
-    """
-    # Проверяем наличие файла
+    """Загружает конфигурацию."""
     if not Path(config_path).exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+        raise FileNotFoundError(f"Config not found: {config_path}")
 
-    # Загружаем YAML
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    # Валидация обязательных env-переменных
     required_env = ["TINKOFF_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
     missing = [e for e in required_env if not os.getenv(e)]
     if missing:
-        raise ValueError(f"Missing required env vars: {', '.join(missing)}")
+        raise ValueError(f"Missing env vars: {', '.join(missing)}")
 
-    # Парсим авторизованных пользователей
     authorized_users = _parse_authorized_users(
         os.getenv("TELEGRAM_AUTHORIZED_USERS", "")
     )
-    
-    # Если не указаны — используем chat_id как единственного авторизованного
     if not authorized_users:
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         if chat_id.lstrip("-").isdigit():
@@ -209,40 +134,19 @@ def load_config(config_path: str = "config.yaml") -> Config:
             risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.01")),
             max_position_pct=float(os.getenv("MAX_POSITION_PCT", "0.25")),
         ),
-        atr=ATRConfig(
-            period=cfg.get("atr", {}).get("period", 14),
-        ),
         bollinger=BollingerConfig(
             period=cfg.get("strategy", {}).get("bollinger_bounce", {}).get("bollinger_period", 20),
             std_multiplier=cfg.get("strategy", {}).get("bollinger_bounce", {}).get("bollinger_std", 2.0),
             entry_threshold_pct=cfg.get("strategy", {}).get("bollinger_bounce", {}).get("entry_threshold_pct", 1.0),
         ),
-        risk=RiskConfig(
-            stop_loss_atr=cfg.get("risk", {}).get("stop_loss_atr", 0.3),
-            take_profit_atr=cfg.get("risk", {}).get("take_profit_atr", 0.5),
-            max_position_pct=cfg.get("risk", {}).get("max_position_pct", 0.25),
-            max_margin_pct=cfg.get("risk", {}).get("max_margin_pct", 0.30),
-            max_open_positions=cfg.get("risk", {}).get("max_open_positions", 3),
-            max_daily_loss_pct=cfg.get("risk", {}).get("max_daily_loss_pct", 0.03),
-            cooldown_after_stop_min=cfg.get("risk", {}).get("cooldown_after_stop_min", 30),
-        ),
         liquidity=LiquidityConfig(
             min_avg_volume_rub=cfg.get("liquidity", {}).get("min_avg_volume_rub", 50_000_000),
-            min_trades_per_day=cfg.get("liquidity", {}).get("min_trades_per_day", 1000),
             max_spread_pct=cfg.get("liquidity", {}).get("max_spread_pct", 0.15),
             lookback_days=cfg.get("liquidity", {}).get("lookback_days", 20),
             max_instruments=cfg.get("liquidity", {}).get("max_instruments", 30),
-            extended_lookback_days=cfg.get("liquidity", {}).get("extended_lookback_days", 90),
-            min_trading_days=cfg.get("liquidity", {}).get("min_trading_days", 26),
-        ),
-        trading_hours=TradingHoursConfig(
-            start=cfg.get("trading_hours", {}).get("start", "10:00"),
-            end=cfg.get("trading_hours", {}).get("end", "19:00"),
-            timezone=cfg.get("trading_hours", {}).get("timezone", "Europe/Moscow"),
         ),
         schedule=ScheduleConfig(
             daily_calc_time=cfg.get("schedule", {}).get("daily_calc_time", "06:30"),
         ),
         dry_run=cfg.get("safety", {}).get("dry_run", True),
-        kill_switch=cfg.get("safety", {}).get("kill_switch", False),
     )
