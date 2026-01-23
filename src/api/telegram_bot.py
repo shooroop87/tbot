@@ -886,3 +886,7 @@ class TelegramBotAiogram:
         """Останавливает бота."""
         logger.info("telegram_bot_stopping")
         await self.bot.session.close()
+
+    async def start(self):
+        """Алиас для совместимости с main.py"""
+        await self.start_polling()
