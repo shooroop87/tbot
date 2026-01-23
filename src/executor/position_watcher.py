@@ -12,11 +12,14 @@
 - auto: полный автомат (SL/TP выставляются автоматически)
 - manual: только уведомления, заявки НЕ выставляются
 - monitor_only: только мониторинг, без уведомлений о действиях
+
+Безопасность:
+- SLPlacementGuard: если SL не выставился за N секунд → аварийное закрытие
 """
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Any, Optional, Set, TYPE_CHECKING
+from typing import Dict, Any, Optional, Set, Callable, TYPE_CHECKING
 from enum import Enum
 
 import structlog
@@ -30,6 +33,117 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SL PLACEMENT GUARD — защита от "голой позиции"
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SLPlacementGuard:
+    """
+    Защита от ситуации когда Entry исполнился, но SL не выставился.
+    
+    Логика:
+    1. При исполнении entry → start_watching(order_id, callback)
+    2. Запускается таймер на timeout_sec
+    3. Если SL выставлен → sl_placed(order_id) отменяет таймер
+    4. Если таймер сработал → вызывается callback (аварийное закрытие)
+    
+    Использование:
+        guard = SLPlacementGuard(timeout_sec=10)
+        
+        # При исполнении entry
+        guard.start_watching(
+            entry_order_id="xxx",
+            on_timeout=self._emergency_close_position,
+            tracked=tracked,
+            executed_price=100.0
+        )
+        
+        # После успешного выставления SL
+        guard.sl_placed("xxx")  # отменяет таймер
+    """
+    
+    def __init__(self, timeout_sec: int = 10):
+        self.timeout_sec = timeout_sec
+        self._tasks: Dict[str, asyncio.Task] = {}
+        self.logger = logger.bind(component="sl_guard")
+    
+    def start_watching(
+        self,
+        entry_order_id: str,
+        on_timeout: Callable,
+        *args,
+        **kwargs
+    ):
+        """
+        Запускает таймер защиты.
+        
+        Args:
+            entry_order_id: ID entry заявки
+            on_timeout: Async callback при таймауте
+            *args, **kwargs: Аргументы для callback
+        """
+        # Отменяем предыдущий таймер если есть
+        if entry_order_id in self._tasks:
+            self._tasks[entry_order_id].cancel()
+        
+        async def _timeout_handler():
+            try:
+                await asyncio.sleep(self.timeout_sec)
+                
+                # Таймер сработал — SL не выставлен!
+                self.logger.error(
+                    "SL_PLACEMENT_TIMEOUT",
+                    entry_order_id=entry_order_id,
+                    timeout_sec=self.timeout_sec,
+                    action="emergency_close"
+                )
+                
+                # Вызываем аварийный callback
+                if asyncio.iscoroutinefunction(on_timeout):
+                    await on_timeout(*args, **kwargs)
+                else:
+                    on_timeout(*args, **kwargs)
+                    
+            except asyncio.CancelledError:
+                pass  # Таймер отменён (SL выставлен успешно)
+            finally:
+                self._tasks.pop(entry_order_id, None)
+        
+        self._tasks[entry_order_id] = asyncio.create_task(_timeout_handler())
+        self.logger.debug(
+            "sl_guard_started",
+            entry_order_id=entry_order_id,
+            timeout_sec=self.timeout_sec
+        )
+    
+    def sl_placed(self, entry_order_id: str):
+        """
+        SL успешно выставлен — отменяем таймер.
+        
+        Вызывать после успешного post_stop_order для SL.
+        """
+        task = self._tasks.pop(entry_order_id, None)
+        if task:
+            task.cancel()
+            self.logger.info("sl_guard_success", entry_order_id=entry_order_id)
+    
+    def cancel_all(self):
+        """Отменяет все активные таймеры."""
+        for task in self._tasks.values():
+            task.cancel()
+        self._tasks.clear()
+        self.logger.debug("sl_guard_all_cancelled")
+    
+    @property
+    def active_count(self) -> int:
+        """Количество активных таймеров."""
+        return len(self._tasks)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ORDER TYPES & DATA CLASSES
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class OrderType(Enum):
     """Типы отслеживаемых заявок."""
@@ -72,6 +186,10 @@ class TrackedOrder:
     created_by: Optional[str] = None
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# POSITION WATCHER
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class PositionWatcher:
     """
     Мониторинг заявок с персистентностью и kill switch.
@@ -80,6 +198,7 @@ class PositionWatcher:
     - Перед ЛЮБЫМ действием проверяет is_active в БД
     - При mode=manual только уведомляет, не выставляет заявки
     - Все заявки сохраняются в БД и переживают рестарт
+    - SLPlacementGuard защищает от "голой позиции"
     
     Использование:
         watcher = PositionWatcher(config, repo, notifier)
@@ -90,6 +209,9 @@ class PositionWatcher:
         # Запуск мониторинга
         await watcher.start()
     """
+
+    # Таймаут на выставление SL (секунды)
+    SL_PLACEMENT_TIMEOUT = 10
 
     def __init__(
         self, 
@@ -107,7 +229,14 @@ class PositionWatcher:
         self._tracked_orders: Dict[str, TrackedOrder] = {}
         self._executed_orders: Set[str] = set()
         
+        # Защита от "голой позиции"
+        self._sl_guard = SLPlacementGuard(timeout_sec=self.SL_PLACEMENT_TIMEOUT)
+        
         self.logger = logger.bind(component="position_watcher")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SAFETY CHECKS
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def _check_bot_active(self) -> bool:
         """
@@ -128,6 +257,10 @@ class PositionWatcher:
             return await self.repo.get_bot_mode()
         except Exception:
             return "manual"  # При ошибке — безопасный режим
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PERSISTENCE
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def load_pending_orders(self):
         """
@@ -169,6 +302,10 @@ class PositionWatcher:
                 
         except Exception as e:
             self.logger.exception("load_pending_orders_error", error=str(e))
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ORDER TRACKING
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def track_order(
         self,
@@ -257,6 +394,10 @@ class PositionWatcher:
         
         self.logger.info("order_untracked", order_id=order_id, reason=reason)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # MAIN LOOP
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def start(self):
         """Запускает мониторинг."""
         self._running = True
@@ -302,11 +443,14 @@ class PositionWatcher:
             
             await asyncio.sleep(self.poll_interval)
         
+        # Cleanup при остановке
+        self._sl_guard.cancel_all()
         self.logger.info("position_watcher_stopped")
 
     async def stop(self):
         """Останавливает мониторинг."""
         self._running = False
+        self._sl_guard.cancel_all()
         self.logger.info("position_watcher_stop_requested")
 
     @property
@@ -319,6 +463,10 @@ class PositionWatcher:
 
     def get_tracked_orders(self) -> Dict[str, TrackedOrder]:
         return self._tracked_orders.copy()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ORDER CHECKING
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def _check_orders(self):
         """Проверяет статус всех отслеживаемых заявок."""
@@ -490,11 +638,15 @@ class PositionWatcher:
         
         await self.untrack_order(tracked.order_id, "cancelled_on_exchange")
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ENTRY EXECUTION
+    # ═══════════════════════════════════════════════════════════════════════════
+
     async def _on_entry_executed(self, client, tracked: TrackedOrder, executed_price: float):
         """
         Заявка на ВХОД исполнена.
         
-        В режиме auto → выставляем SL и TP
+        В режиме auto → выставляем SL и TP с защитой
         В режиме manual → только уведомляем
         """
         mode = await self._get_bot_mode()
@@ -538,8 +690,25 @@ class PositionWatcher:
                 del self._tracked_orders[tracked.order_id]
             return
         
-        # Режим auto — выставляем SL и TP
+        # ═══════════════════════════════════════════════════════════════════════
+        # РЕЖИМ AUTO: выставляем SL и TP с защитой от "голой позиции"
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        # Запускаем защитный таймер ПЕРЕД выставлением SL
+        # Если SL не выставится за N секунд — аварийное закрытие
+        self._sl_guard.start_watching(
+            entry_order_id=tracked.order_id,
+            on_timeout=self._emergency_close_position,
+            tracked=tracked,
+            executed_price=executed_price
+        )
+        
+        # Выставляем SL и TP
         await self._place_sl_tp(client, tracked, executed_price, sl_price, tp_price)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SL/TP PLACEMENT
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def _place_sl_tp(
         self, 
@@ -549,7 +718,12 @@ class PositionWatcher:
         sl_price: float,
         tp_price: float
     ):
-        """Выставляет SL и TP заявки."""
+        """
+        Выставляет SL и TP заявки.
+        
+        ⚠️ ВАЖНО: При успешном выставлении SL вызывает sl_guard.sl_placed()
+        чтобы отменить защитный таймер.
+        """
         from decimal import Decimal
         from t_tech.invest.utils import decimal_to_quotation
         from t_tech.invest import (
@@ -562,7 +736,7 @@ class PositionWatcher:
         sl_success = False
         tp_success = False
         
-        # === STOP-LOSS ===
+        # === STOP-LOSS (критически важен!) ===
         try:
             sl_response = await services.stop_orders.post_stop_order(
                 figi=tracked.figi,
@@ -576,6 +750,16 @@ class PositionWatcher:
             
             tracked.sl_order_id = sl_response.stop_order_id
             sl_success = True
+            
+            # ✅ ВАЖНО: SL выставлен — отменяем защитный таймер!
+            self._sl_guard.sl_placed(tracked.order_id)
+            
+            self.logger.info(
+                "stop_loss_placed",
+                order_id=sl_response.stop_order_id,
+                ticker=tracked.ticker,
+                price=sl_price
+            )
             
             # Сохраняем SL в отслеживание
             await self.track_order(
@@ -598,10 +782,18 @@ class PositionWatcher:
             await self.repo.increment_stats(orders_placed=1)
             
         except Exception as e:
+            # ❌ SL НЕ выставлен!
+            # Защитный таймер продолжает тикать и вызовет аварийное закрытие
             self.logger.exception("stop_loss_error", error=str(e))
-            await self.notifier.send_error(f"SL не выставлен: {str(e)}", tracked.ticker)
+            await self.notifier.send_message(
+                f"🚨 <b>КРИТИЧЕСКАЯ ОШИБКА!</b>\n"
+                f"📌 {tracked.ticker}\n"
+                f"❌ SL НЕ ВЫСТАВЛЕН: {str(e)[:100]}\n\n"
+                f"⏳ Аварийное закрытие через {self.SL_PLACEMENT_TIMEOUT} сек..."
+            )
+            # НЕ возвращаемся — пробуем TP, но таймер уже тикает
         
-        # === TAKE-PROFIT ===
+        # === TAKE-PROFIT (менее критичен) ===
         try:
             tp_response = await services.stop_orders.post_stop_order(
                 figi=tracked.figi,
@@ -615,6 +807,13 @@ class PositionWatcher:
             
             tracked.tp_order_id = tp_response.stop_order_id
             tp_success = True
+            
+            self.logger.info(
+                "take_profit_placed",
+                order_id=tp_response.stop_order_id,
+                ticker=tracked.ticker,
+                price=tp_price
+            )
             
             # Сохраняем TP в отслеживание
             await self.track_order(
@@ -648,36 +847,127 @@ class PositionWatcher:
                 tp_order_id=tracked.tp_order_id
             )
         
-        # Итоговое уведомление
-        if sl_success and tp_success:
+        # Итоговое уведомление (только если SL успешно)
+        if sl_success:
+            if tp_success:
+                await self.notifier.send_message(
+                    f"🎯 <b>SL и TP выставлены!</b>\n"
+                    f"📌 {tracked.ticker}\n"
+                    f"🛑 SL: {sl_price:,.2f} ₽\n"
+                    f"🎯 TP: {tp_price:,.2f} ₽"
+                )
+            else:
+                await self.notifier.send_message(
+                    f"⚠️ <b>Только SL выставлен!</b>\n"
+                    f"📌 {tracked.ticker}\n"
+                    f"🛑 SL: {sl_price:,.2f} ₽\n"
+                    f"❌ TP НЕ выставлен — выставьте вручную"
+                )
+        # Если SL не выставлен — таймер сработает и вызовет аварийное закрытие
+        
+        # Удаляем entry из отслеживания (если SL выставлен)
+        if sl_success and tracked.order_id in self._tracked_orders:
+            del self._tracked_orders[tracked.order_id]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # EMERGENCY CLOSE — аварийное закрытие при сбое SL
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def _emergency_close_position(
+        self, 
+        tracked: TrackedOrder, 
+        executed_price: float
+    ):
+        """
+        Аварийное закрытие позиции когда SL не выставился.
+        
+        Вызывается автоматически через SLPlacementGuard после таймаута.
+        
+        Действия:
+        1. Критическое уведомление в Telegram
+        2. Закрытие позиции по маркету
+        3. Очистка отслеживания
+        """
+        self.logger.critical(
+            "EMERGENCY_CLOSE",
+            ticker=tracked.ticker,
+            order_id=tracked.order_id,
+            executed_price=executed_price,
+            reason="SL placement failed"
+        )
+        
+        # Критическое уведомление
+        await self.notifier.send_message(
+            f"🚨🚨🚨 <b>АВАРИЙНОЕ ЗАКРЫТИЕ!</b> 🚨🚨🚨\n\n"
+            f"📌 {tracked.ticker}\n"
+            f"💰 Цена входа: {executed_price:,.2f} ₽\n"
+            f"📦 Кол-во: {tracked.quantity} лот(ов)\n\n"
+            f"⚠️ <b>SL НЕ ВЫСТАВЛЕН за {self.SL_PLACEMENT_TIMEOUT} сек!</b>\n\n"
+            f"🔄 Закрываю позицию по маркету..."
+        )
+        
+        # Импорт здесь чтобы избежать circular import
+        from api.tinkoff_client import TinkoffClient
+        
+        try:
+            async with TinkoffClient(self.config.tinkoff) as client:
+                services = client._services
+                
+                # Закрываем по маркету
+                from t_tech.invest import (
+                    OrderDirection,
+                    OrderType as TinkoffOrderType,
+                )
+                
+                response = await services.orders.post_order(
+                    figi=tracked.figi,
+                    quantity=tracked.quantity,
+                    direction=OrderDirection.ORDER_DIRECTION_SELL,
+                    account_id=self.config.tinkoff.account_id,
+                    order_type=TinkoffOrderType.ORDER_TYPE_MARKET,
+                )
+                
+                self.logger.info(
+                    "emergency_close_success",
+                    order_id=response.order_id,
+                    ticker=tracked.ticker
+                )
+                
+                await self.notifier.send_message(
+                    f"✅ <b>Позиция закрыта по маркету</b>\n\n"
+                    f"📌 {tracked.ticker}\n"
+                    f"🔍 Order ID: <code>{response.order_id}</code>\n\n"
+                    f"⚠️ Проверьте исполнение в терминале!"
+                )
+                
+                # Обновляем статус в БД
+                await self.repo.mark_order_executed(
+                    tracked.order_id,
+                    executed_price=executed_price,
+                    execution_reason="emergency_close"
+                )
+                
+        except Exception as e:
+            self.logger.exception("emergency_close_failed", error=str(e))
+            
             await self.notifier.send_message(
-                f"🎯 <b>SL и TP выставлены!</b>\n"
+                f"❌❌❌ <b>НЕ УДАЛОСЬ ЗАКРЫТЬ ПОЗИЦИЮ!</b> ❌❌❌\n\n"
                 f"📌 {tracked.ticker}\n"
-                f"🛑 SL: {sl_price:,.2f} ₽\n"
-                f"🎯 TP: {tp_price:,.2f} ₽"
-            )
-        elif sl_success:
-            await self.notifier.send_message(
-                f"⚠️ <b>Только SL выставлен!</b>\n"
-                f"📌 {tracked.ticker}\n"
-                f"❌ TP НЕ выставлен!"
-            )
-        elif tp_success:
-            await self.notifier.send_message(
-                f"⚠️ <b>Только TP выставлен!</b>\n"
-                f"📌 {tracked.ticker}\n"
-                f"❌ SL НЕ выставлен! ОПАСНО!"
-            )
-        else:
-            await self.notifier.send_message(
-                f"❌ <b>SL и TP НЕ выставлены!</b>\n"
-                f"📌 {tracked.ticker}\n"
-                f"⚠️ Позиция БЕЗ ЗАЩИТЫ!"
+                f"📦 Кол-во: {tracked.quantity} лот(ов)\n"
+                f"💥 Ошибка: {str(e)[:200]}\n\n"
+                f"⚠️⚠️⚠️ <b>ЗАКРОЙТЕ ВРУЧНУЮ В ТЕРМИНАЛЕ НЕМЕДЛЕННО!</b> ⚠️⚠️⚠️\n"
+                f"https://www.tinkoff.ru/terminal/"
             )
         
-        # Удаляем entry из отслеживания
+        # Очищаем отслеживание
         if tracked.order_id in self._tracked_orders:
             del self._tracked_orders[tracked.order_id]
+        if tracked.tp_order_id and tracked.tp_order_id in self._tracked_orders:
+            del self._tracked_orders[tracked.tp_order_id]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SL/TP EXECUTION HANDLERS
+    # ═══════════════════════════════════════════════════════════════════════════
 
     async def _on_stop_loss_executed(self, tracked: TrackedOrder, executed_price: float):
         """Стоп-лосс сработал."""
@@ -689,7 +979,7 @@ class PositionWatcher:
             f"💰 Вход: {tracked.entry_price:,.2f} ₽\n"
             f"📤 Выход: {executed_price:,.2f} ₽\n"
             f"📦 Кол-во: {tracked.quantity} лот(ов)\n"
-            f"💸 P&L: {pnl['pnl_rub']:+,.0f} ₽ ({pnl['pnl_pct']:+.2f}%)"
+            f"💸 P&L: <b>{pnl['pnl_rub']:+,.0f} ₽</b> ({pnl['pnl_pct']:+.2f}%)"
         )
         
         await self._cancel_related_order(tracked, "tp")
@@ -707,7 +997,7 @@ class PositionWatcher:
             f"💰 Вход: {tracked.entry_price:,.2f} ₽\n"
             f"📤 Выход: {executed_price:,.2f} ₽\n"
             f"📦 Кол-во: {tracked.quantity} лот(ов)\n"
-            f"💰 P&L: {pnl['pnl_rub']:+,.0f} ₽ ({pnl['pnl_pct']:+.2f}%)"
+            f"💰 P&L: <b>{pnl['pnl_rub']:+,.0f} ₽</b> ({pnl['pnl_pct']:+.2f}%)"
         )
         
         await self._cancel_related_order(tracked, "sl")

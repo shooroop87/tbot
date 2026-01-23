@@ -61,3 +61,28 @@ instruments:
   # shares:
   #   - figi: "BBG004730N88"      # Sber
   #   - figi: "BBG006L8G4H1"      # Yandex
+
+
+# ===== FREE TRADING (новый раздел) =====
+free_trading:
+  enabled: false  # Включить свободный трейдинг
+  
+  # Валидация цены входа
+  max_price_deviation_pct: 5.0  # Макс отклонение от текущей цены
+  
+  # Лимиты безопасности
+  max_concurrent_positions: 3   # Макс одновременных позиций
+  max_daily_trades: 10          # Макс сделок в день
+  max_daily_loss_rub: 10000     # Макс дневной убыток
+  
+  # Таймауты
+  sl_placement_timeout_sec: 10  # Если SL не выставился — аварийное закрытие
+  confirmation_timeout_sec: 60  # Таймаут на подтверждение заявки
+  
+  # Торговые часы (МСК) — не торгуем в волатильные периоды
+  trading_start: "10:05"  # Пропускаем первые 5 минут
+  trading_end: "18:40"    # Пропускаем последние 20 минут
+  
+  # Risk-Reward по умолчанию (1:3)
+  sl_atr_multiplier: 1.0
+  tp_atr_multiplier: 3.0
